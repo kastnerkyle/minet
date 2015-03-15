@@ -1,0 +1,1213 @@
+# -*- coding: utf 8 -*-
+from __future__ import division
+try:
+    import cPickle
+except ImportError:
+    import pickle as cPickle
+import tempfile
+import numpy as np
+from scipy import linalg
+import theano
+import theano.tensor as T
+from theano.compat.python2x import OrderedDict
+# Sandbox?
+from theano.tensor.shared_randomstreams import RandomStreams
+
+
+def concatenate(tensor_list, axis=0):
+    """
+    Alternative implementation of `theano.tensor.concatenate`.
+    This function does exactly the same thing, but contrary to Theano's own
+    implementation, the gradient is implemented on the GPU.
+    Stolen from Lasagne
+    """
+    if axis < 0:
+        axis += tensor_list[0].ndim
+
+    concat_size = sum(tensor.shape[axis] for tensor in tensor_list)
+
+    output_shape = ()
+    for k in range(axis):
+        output_shape += (tensor_list[0].shape[k],)
+    output_shape += (concat_size,)
+    for k in range(axis + 1, tensor_list[0].ndim):
+        output_shape += (tensor_list[0].shape[k],)
+
+    out = T.zeros(output_shape)
+    offset = 0
+    for tensor in tensor_list:
+        indices = ()
+        for k in range(axis):
+            indices += (slice(None),)
+        indices += (slice(offset, offset + tensor.shape[axis]),)
+        for k in range(axis + 1, tensor_list[0].ndim):
+            indices += (slice(None),)
+
+        out = T.set_subtensor(out[indices], tensor)
+        offset += tensor.shape[axis]
+
+    return out
+
+
+def minibatch_indices(X, minibatch_size):
+    minibatch_indices = np.arange(0, len(X), minibatch_size)
+    minibatch_indices = np.asarray(list(minibatch_indices) + [len(X)])
+    start_indices = minibatch_indices[:-1]
+    end_indices = minibatch_indices[1:]
+    return zip(start_indices, end_indices)
+
+
+def make_minibatch(X, y, one_hot_size):
+    minibatch_size = len(X)
+    is_one_hot = True
+    X_max_sizes = np.max([xi.shape for xi in X], axis=0)
+    X_max_sizes = np.asarray([minibatch_size] + list(X_max_sizes))
+    # Order into time, samples, feature
+    X_max_sizes = np.array([X_max_sizes[1], X_max_sizes[0],
+                            X_max_sizes[2]])
+    y_max_sizes = np.max([yi.shape for yi in y], axis=0)
+    y_max_sizes = np.array([minibatch_size] + list(y_max_sizes))
+    # Order into time, samples, label
+    # dim is 1 for output label? This may need adjustment for regression
+    if len(y_max_sizes) == 3:
+        y_max_sizes = np.array([y_max_sizes[1], y_max_sizes[0], y_max_sizes[2]])
+    elif len(y_max_sizes) < 3:
+        y_max_sizes = np.array([y_max_sizes[1], y_max_sizes[0], one_hot_size])
+        is_one_hot = False
+    else:
+        raise ValueError("y must be 2 or 3 dimensional!")
+
+    for y_t in y:
+        if not np.all(np.in1d([0, 1], np.unique(y_t.ravel()))):
+            is_one_hot = False
+    X_n = np.zeros(X_max_sizes, dtype=X[0].dtype)
+    y_n = np.zeros(y_max_sizes).astype(theano.config.floatX)
+    X_mask = np.zeros((X_max_sizes[0], X_max_sizes[1])).astype(
+        theano.config.floatX)
+    y_mask = np.zeros((y_max_sizes[0], y_max_sizes[1])).astype(
+        theano.config.floatX)
+    for n, t in enumerate(X):
+        xshp = X[n].shape
+        X_n[:xshp[0], n, :xshp[1]] = X[n]
+        X_mask[:xshp[0], n] = 1.
+
+    for n, t in enumerate(y):
+        yshp = y[n].shape
+        if not is_one_hot:
+            for i, v in enumerate(y[n]):
+                y_n[i, n, v] = 1.
+        else:
+            y_n[:yshp[0], n, :yshp[1]] = y[n]
+        y_mask[:yshp[0], n] = 1.
+    return X_n, y_n, X_mask, y_mask
+
+
+def labels_to_chars(labels):
+    return "".join([chr(l + 97) for l in labels])
+
+
+def _make_ctc_labels(y):
+    # Assume that class values are sequential! and start from 0
+    highest_class = np.max([np.max(d) for d in y])
+    # Need to insert blanks at start, end, and between each label
+    # See A. Graves "Supervised Sequence Labelling with Recurrent Neural
+    # Networks" figure 7.2 (pg. 58)
+    # (http://www.cs.toronto.edu/~graves/preprint.pdf)
+    blank = highest_class + 1
+    y_fixed = [blank * np.ones(2 * yi.shape[0] + 1).astype('int32')
+               for yi in y]
+    for i, yi in enumerate(y):
+        y_fixed[i][1:-1:2] = yi
+    return y_fixed
+
+
+def relu(x):
+    return x * (x > 1e-6)
+
+
+def clip_relu(x, clip_lim=20):
+    return x * (T.lt(x, 1e-6) and T.gt(x, clip_lim))
+
+
+def dropout(random_state, X, keep_prob=0.5):
+    if keep_prob > 0. and keep_prob < 1.:
+        seed = random_state.randint(2 ** 30)
+        srng = RandomStreams(seed)
+        mask = srng.binomial(n=1, p=keep_prob, size=X.shape,
+                             dtype=theano.config.floatX)
+        return X * mask
+    return X
+
+
+def fast_dropout(random_state, X):
+    seed = random_state.randint(2 ** 30)
+    srng = RandomStreams(seed)
+    mask = srng.normal(size=X.shape, avg=1., dtype=theano.config.floatX)
+    return X * mask
+
+
+def shared_zeros(shape):
+    """ Builds a theano shared variable filled with a zeros numpy array """
+    return theano.shared(value=np.zeros(*shape).astype(theano.config.floatX),
+                         borrow=True)
+
+
+def shared_rand(shape, rng):
+    """ Builds a theano shared variable filled with random values """
+    return theano.shared(value=(0.01 * (rng.rand(*shape) - 0.5)).astype(
+        theano.config.floatX), borrow=True)
+
+
+def np_rand(shape, rng):
+    return (0.01 * (rng.rand(*shape) - 0.5)).astype(theano.config.floatX)
+
+
+def np_randn(shape, rng, name=None):
+    """ Builds a numpy variable filled with random normal values """
+    return (0.01 * rng.randn(*shape)).astype(theano.config.floatX)
+
+
+def np_ortho(shape, rng, name=None):
+    """ Builds a theano variable filled with orthonormal random values """
+    g = rng.randn(*shape)
+    o_g = linalg.svd(g)[0]
+    return o_g.astype(theano.config.floatX)
+
+
+def shared_ortho(shape, rng, name=None):
+    """ Builds a theano shared variable filled with random values """
+    g = rng.randn(*shape)
+    o_g = linalg.svd(g)[0]
+    return theano.shared(value=o_g.astype(theano.config.floatX), borrow=True)
+
+
+
+
+class PickleMixin(object):
+    def __getstate__(self):
+        if not hasattr(self, '_pickle_skip_list'):
+            self._pickle_skip_list = []
+            for k, v in self.__dict__.items():
+                try:
+                    f = tempfile.TemporaryFile()
+                    cPickle.dump(v, f)
+                except:
+                    self._pickle_skip_list.append(k)
+        state = OrderedDict()
+        for k, v in self.__dict__.items():
+            if k not in self._pickle_skip_list:
+                state[k] = v
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__ = state
+
+
+class TrainingMixin(object):
+    def get_sgd_updates(self, X_sym, y_sym, params, cost, learning_rate,
+                        momentum):
+        gparams = T.grad(cost, params)
+        updates = OrderedDict()
+
+        if not hasattr(self, "momentum_velocity_"):
+            self.momentum_velocity_ = [0.] * len(gparams)
+
+        for n, (param, gparam) in enumerate(zip(params, gparams)):
+            velocity = self.momentum_velocity_[n]
+            update_step = momentum * velocity - learning_rate * gparam
+            self.momentum_velocity_[n] = update_step
+            updates[param] = param + update_step
+
+        return updates
+
+    def _norm_constraint(self, param, update_step, max_col_norm):
+        stepped_param = param + update_step
+        if param.get_value(borrow=True).ndim == 2:
+            col_norms = T.sqrt(T.sum(T.sqr(stepped_param), axis=0))
+            desired_norms = T.clip(col_norms, 0, max_col_norm)
+            scale = desired_norms / (1e-7 + col_norms)
+            new_param = param * scale
+            new_update_step = update_step * scale
+        else:
+            new_param = param
+            new_update_step = update_step
+        return new_param, new_update_step
+
+    def get_clip_sgd_updates(self, X_sym, y_sym, params, cost, learning_rate,
+                             momentum, rescale=5.):
+        gparams = T.grad(cost, params)
+        updates = OrderedDict()
+
+        if not hasattr(self, "momentum_velocity_"):
+            self.momentum_velocity_ = [0.] * len(gparams)
+
+        # Gradient clipping
+        grad_norm = T.sqrt(sum(map(lambda x: T.sqr(x).sum(), gparams)))
+        not_finite = T.or_(T.isnan(grad_norm), T.isinf(grad_norm))
+        grad_norm = T.sqrt(grad_norm)
+        scaling_num = rescale
+        scaling_den = T.maximum(rescale, grad_norm)
+        for n, (param, gparam) in enumerate(zip(params, gparams)):
+            # clip gradient directly, not momentum etc.
+            gparam = T.switch(not_finite, 0.1 * param,
+                              gparam * (scaling_num / scaling_den))
+            velocity = self.momentum_velocity_[n]
+            update_step = momentum * velocity - learning_rate * gparam
+            self.momentum_velocity_[n] = update_step
+            updates[param] = param + update_step
+        return updates
+
+    def get_clip_rmsprop_updates(self, X_sym, y_sym, params, cost,
+                                 learning_rate, momentum, rescale=5.):
+        gparams = T.grad(cost, params)
+        updates = OrderedDict()
+
+        if not hasattr(self, "running_average_"):
+            self.running_square_ = [0.] * len(gparams)
+            self.running_avg_ = [0.] * len(gparams)
+            self.updates_storage_ = [0.] * len(gparams)
+
+        if not hasattr(self, "momentum_velocity_"):
+            self.momentum_velocity_ = [0.] * len(gparams)
+
+        # Gradient clipping
+        grad_norm = T.sqrt(sum(map(lambda x: T.sqr(x).sum(), gparams)))
+        not_finite = T.or_(T.isnan(grad_norm), T.isinf(grad_norm))
+        grad_norm = T.sqrt(grad_norm)
+        scaling_num = rescale
+        scaling_den = T.maximum(rescale, grad_norm)
+        for n, (param, gparam) in enumerate(zip(params, gparams)):
+            gparam = T.switch(not_finite, 0.1 * param,
+                              gparam * (scaling_num / scaling_den))
+            combination_coeff = 0.9
+            minimum_grad = 1e-4
+            old_square = self.running_square_[n]
+            new_square = combination_coeff * old_square + (
+                1. - combination_coeff) * T.sqr(gparam)
+            old_avg = self.running_avg_[n]
+            new_avg = combination_coeff * old_avg + (
+                1. - combination_coeff) * gparam
+            rms_grad = T.sqrt(new_square - new_avg ** 2)
+            rms_grad = T.maximum(rms_grad, minimum_grad)
+            velocity = self.momentum_velocity_[n]
+            update_step = momentum * velocity - learning_rate * (
+                gparam / rms_grad)
+            self.running_square_[n] = new_square
+            self.running_avg_[n] = new_avg
+            self.updates_storage_[n] = update_step
+            self.momentum_velocity_[n] = update_step
+            updates[param] = param + update_step
+
+        return updates
+
+    def get_sfg_updates(self, X_sym, y_sym, params, cost,
+                        learning_rate, momentum):
+        gparams = T.grad(cost, params)
+        updates = OrderedDict()
+        from sfg import SFG
+        if not hasattr(self, "sfg_"):
+            self.count_ = theano.shared(0)
+            self.slow_freq_ = 20
+            self.sfg_ = SFG(params, gparams)
+
+        slow_updates, fast_updates = self.sfg_.updates(self.learning_rate,
+                                                       self.momentum,
+                                                       epsilon=0.0001,
+                                                       momentum_clipping=None)
+        for param in slow_updates.keys():
+            updates[param] = theano.ifelse.ifelse(T.eq(self.count_,
+                                                       self.slow_freq_ - 1),
+                                                  slow_updates[param],
+                                                  fast_updates[param])
+        updates[self.count_] = T.mod(self.count_ + 1, self.slow_freq_)
+        return updates
+
+
+def init_linear_layer(input_size, output_size, random_state):
+    W_values = np.asarray(random_state.uniform(
+        low=-np.sqrt(6. / (input_size + output_size)),
+        high=np.sqrt(6. / (input_size + output_size)),
+        size=(input_size, output_size)), dtype=theano.config.floatX)
+    W = theano.shared(value=W_values, name='W', borrow=True)
+    b_values = np.zeros((output_size,), dtype=theano.config.floatX)
+    b = theano.shared(value=b_values, name='b', borrow=True)
+    params = [W, b]
+    return params
+
+
+def build_linear_layer_from_params(params, input_variable):
+    W, b = params
+    output_variable = T.dot(input_variable, W) + b
+    return output_variable, params
+
+
+def build_linear_layer(input_size, output_size, input_variable, random_state):
+    params = init_linear_layer(input_size, output_size, random_state)
+    return build_linear_layer_from_params(params, input_variable)
+
+
+def init_tanh_layer(input_size, output_size, random_state):
+    W_values = np.asarray(random_state.uniform(
+        low=-np.sqrt(6. / (input_size + output_size)),
+        high=np.sqrt(6. / (input_size + output_size)),
+        size=(input_size, output_size)), dtype=theano.config.floatX)
+    W = theano.shared(value=W_values, name='W', borrow=True)
+    b_values = np.zeros((output_size,), dtype=theano.config.floatX)
+    b = theano.shared(value=b_values, name='b', borrow=True)
+    params = [W, b]
+    return params
+
+
+def build_tanh_layer_from_params(params, input_variable):
+    W, b = params
+    output_variable = T.tanh(T.dot(input_variable, W) + b)
+    return output_variable, params
+
+
+def build_tanh_layer(input_size, output_size, input_variable, random_state):
+    params = init_tanh_layer(input_size, output_size, random_state)
+    return build_tanh_layer_from_params(params, input_variable)
+
+
+def build_relu_layer(input_size, output_size, input_variable, random_state):
+    W_values = np.asarray(random_state.uniform(
+        low=-np.sqrt(6. / (input_size + output_size)),
+        high=np.sqrt(6. / (input_size + output_size)),
+        size=(input_size, output_size)), dtype=theano.config.floatX)
+    W = theano.shared(value=W_values, name='W', borrow=True)
+    b_values = np.zeros((output_size,), dtype=theano.config.floatX)
+    b = theano.shared(value=b_values, name='b', borrow=True)
+    output_variable = relu(T.dot(input_variable, W) + b)
+    params = [W, b]
+    return output_variable, params
+
+
+def build_sigmoid_layer(input_size, output_size, input_variable, random_state):
+    W_values = np.asarray(random_state.uniform(
+        low=-np.sqrt(6. / (input_size + output_size)),
+        high=np.sqrt(6. / (input_size + output_size)),
+        size=(input_size, output_size)), dtype=theano.config.floatX)
+    W = theano.shared(value=4 * W_values, name='W', borrow=True)
+    b_values = np.zeros((output_size,), dtype=theano.config.floatX)
+    b = theano.shared(value=b_values, name='b', borrow=True)
+    output_variable = T.nnet.sigmoid(T.dot(input_variable, W) + b)
+    params = [W, b]
+    return output_variable, params
+
+
+def softmax_cost(y_hat_sym, y_sym):
+    return -T.mean(T.log(y_hat_sym)[T.arange(y_sym.shape[0]), y_sym])
+
+"""
+class FeedforwardNetwork(PickleMixin, TrainingMixin):
+    def __init__(self, hidden_layer_sizes=[500], batch_size=100, max_iter=1E3,
+                 learning_rate=0.01, momentum=0., learning_alg="sgd",
+                 activation="tanh", model_save_name="saved_model",
+                 save_frequency=100, random_seed=None):
+
+        if random_seed is None or type(random_seed) is int:
+            self.random_state = np.random.RandomState(random_seed)
+        self.max_iter = int(max_iter)
+        self.hidden_layer_sizes = hidden_layer_sizes
+        self.batch_size = batch_size
+        self.save_frequency = save_frequency
+        self.model_save_name = model_save_name
+
+        self.learning_rate = learning_rate
+        self.momentum = momentum
+        self.learning_alg = learning_alg
+        if activation == "relu":
+            self.feedforward_function = build_relu_layer
+        elif activation == "tanh":
+            self.feedforward_function = build_tanh_layer
+        elif activation == "sigmoid":
+            self.feedforward_function = build_sigmoid_layer
+        else:
+            raise ValueError("Value %s not understood for activation"
+                             % activation)
+
+    def _setup_functions(self, X_sym, y_sym, layer_sizes):
+        input_variable = X_sym
+        params = []
+        for i, (input_size, output_size) in enumerate(zip(layer_sizes[:-1],
+                                                          layer_sizes[1:-1])):
+            output_variable, layer_params = self.feedforward_function(
+                input_size, output_size, input_variable, self.random_state)
+            params.extend(layer_params)
+            input_variable = output_variable
+
+        output_variable, layer_params = build_linear_layer(
+            layer_sizes[-2], layer_sizes[-1], input_variable, self.random_state)
+        params.extend(layer_params)
+        y_hat_sym = T.nnet.softmax(output_variable)
+        cost = softmax_cost(y_hat_sym, y_sym)
+
+        self.params_ = params
+
+        if self.learning_alg == "sgd":
+            updates = self.get_sgd_updats(X_sym, y_sym, params, cost,
+                                          self.learning_rate,
+                                          self.momentum)
+        else:
+            raise ValueError("Algorithm %s is not "
+                             "a valid argument for learning_alg!"
+                             % self.learning_alg)
+        self.fit_function = theano.function(
+            inputs=[X_sym, y_sym], outputs=cost, updates=updates)
+        self.loss_function = theano.function(
+            inputs=[X_sym, y_sym], outputs=cost)
+
+        self.predict_function = theano.function(
+            inputs=[X_sym],
+            outputs=[y_hat_sym],)
+
+    def partial_fit(self, X, y):
+        return self.fit_function(X, y.astype('int32'))
+
+    def fit(self, X, y, valid_X=None, valid_y=None):
+        input_size = X.shape[1]
+        output_size = len(np.unique(y))
+        X_sym = T.matrix('x')
+        y_sym = T.ivector('y')
+        self.layers_ = []
+        self.layer_sizes_ = [input_size]
+        self.layer_sizes_.extend(self.hidden_layer_sizes)
+        self.layer_sizes_.append(output_size)
+        self.training_loss_ = []
+        self.validation_loss_ = []
+
+        if not hasattr(self, 'fit_function'):
+            self._setup_functions(X_sym, y_sym,
+                                  self.layer_sizes_)
+
+        batch_indices = list(range(0, X.shape[0], self.batch_size))
+        if X.shape[0] != batch_indices[-1]:
+            batch_indices.append(X.shape[0])
+
+        best_valid_loss = np.inf
+        for itr in range(self.max_iter):
+            print("Starting pass %d through the dataset" % itr)
+            batch_bounds = list(zip(batch_indices[:-1], batch_indices[1:]))
+            # Random minibatches
+            self.random_state.shuffle(batch_bounds)
+            for start, end in batch_bounds:
+                self.partial_fit(X[start:end], y[start:end])
+            current_train_loss = self.loss_function(X, y)
+            self.training_loss_.append(current_train_loss)
+
+            if (itr % self.save_frequency) == 0 or (itr == self.max_iter):
+                f = open(self.model_save_name + "_snapshot.pkl", 'wb')
+                cPickle.dump(self, f, protocol=2)
+                f.close()
+
+            if valid_X is not None:
+                current_valid_loss = self.loss_function(valid_X, valid_y)
+                self.validation_loss_.append(current_valid_loss)
+                print("Validation loss %f" % current_valid_loss)
+                # if we got the best validation score until now, save
+                if current_valid_loss < best_valid_loss:
+                    best_valid_loss = current_valid_loss
+                    f = open(self.model_save_name + "_best.pkl", 'wb')
+                    cPickle.dump(self, f, protocol=2)
+                    f.close()
+        return self
+
+    def predict(self, X):
+        return np.argmax(self.predict_function(X), axis=1)
+"""
+
+
+def init_recurrent_conditional_lstm_layer(input_size, hidden_size, output_size,
+                                          random_state):
+    # input to LSTM
+    W_ = np.concatenate(
+        [np_rand((input_size, hidden_size), random_state),
+         np_rand((input_size, hidden_size), random_state),
+         np_rand((input_size, hidden_size), random_state),
+         np_rand((input_size, hidden_size), random_state)],
+        axis=1)
+
+    W = theano.shared(W_, borrow=True)
+
+    # LSTM to LSTM
+    U_ = np.concatenate(
+        [np_ortho((hidden_size, hidden_size), random_state),
+         np_ortho((hidden_size, hidden_size), random_state),
+         np_ortho((hidden_size, hidden_size), random_state),
+         np_ortho((hidden_size, hidden_size), random_state)],
+        axis=1)
+
+    U = theano.shared(U_, borrow=True)
+
+    # bias to LSTM
+    # TODO: Ilya init for biases...
+    b = shared_zeros((4 * hidden_size,))
+
+    # Context to LSTM
+    Wc = shared_rand((output_size, 4 * hidden_size), random_state)
+
+    # attention: context to hidden
+    Wc_att = shared_ortho((output_size, output_size), random_state)
+
+    # attention: LSTM to hidden
+    Wd_att = shared_rand((hidden_size, output_size), random_state)
+
+    # attention: hidden bias
+    b_att = shared_zeros((output_size,))
+
+    # attention
+    U_att = shared_rand((output_size, 1), random_state)
+    c_att = shared_zeros((1,))
+
+    params = [W, U, b, Wc, Wc_att, Wd_att, b_att, U_att, c_att]
+
+    return params
+
+
+def build_recurrent_conditional_lstm_layer(input_size, hidden_size, output_size,
+                                           input_variable, mask, context,
+                                           context_mask, init_state,
+                                           init_memory, random_state,
+                                           one_step=False):
+    params = init_recurrent_conditional_lstm_layer(input_size, hidden_size,
+                                                   output_size, random_state)
+
+    return build_recurrent_conditional_lstm_layer_from_params(params,
+                                                              input_variable,
+                                                              mask, context,
+                                                              context_mask,
+                                                              init_state,
+                                                              init_memory,
+                                                              random_state,
+                                                              one_step=one_step)
+
+
+def build_recurrent_conditional_lstm_layer_from_params(params, input_variable,
+                                                       mask, context,
+                                                       context_mask, init_state,
+                                                       init_memory,
+                                                       random_state,
+                                                       one_step=False):
+    [W, U, b, Wc, Wc_att, Wd_att, b_att, U_att, c_att] = params
+
+    n_steps = input_variable.shape[0]
+    n_samples = input_variable.shape[1]
+    n_features = input_variable.shape[2]
+
+    hidden_size = U.shape[0]
+
+    # projected context
+    projected_context = T.dot(context, Wc_att) + b_att
+
+    # projected input
+    x = T.dot(input_variable, W) + b
+
+    def _slice(X, n, hidden_size):
+        # Function is needed because tensor size changes across calls to step?
+        if X.ndim == 3:
+            return X[:, :, n * hidden_size:(n + 1) * hidden_size]
+        return X[:, n * hidden_size:(n + 1) * hidden_size]
+
+    def step(x_t, m, h_tm1, c_tm1, ctx_t, att, pctx_):
+        projected_state = T.dot(h_tm1, Wd_att)
+        pctx_ = T.tanh(pctx_ + projected_state[None, :, :])
+        new_att = T.dot(pctx_, U_att) + c_att
+        new_att = new_att.reshape([new_att.shape[0], new_att.shape[1]])
+        new_att = T.exp(new_att) * context_mask
+        new_att = new_att / new_att.sum(axis=0, keepdims=True)
+        # Current context
+        ctx_t = (context * new_att[:, :, None]).sum(axis=0)
+
+        preactivation = T.dot(h_tm1, U)
+        preactivation += x_t
+        preactivation += T.dot(ctx_t, Wc)
+
+        i_t = T.nnet.sigmoid(_slice(preactivation, 0, hidden_size))
+        f_t = T.nnet.sigmoid(_slice(preactivation, 1, hidden_size))
+        o_t = T.nnet.sigmoid(_slice(preactivation, 2, hidden_size))
+        c_t = T.tanh(_slice(preactivation, 3, hidden_size))
+
+        c_t = f_t * c_tm1 + i_t * c_t
+        c_t = m[:, None] * c_t + (1. - m)[:, None] * c_tm1
+        h_t = o_t * T.tanh(c_t)
+        h_t = m[:, None] * h_t + (1. - m)[:, None] * h_tm1
+        return (h_t, c_t, ctx_t, new_att.T, projected_state,
+                i_t, f_t, o_t, preactivation)
+
+    init_context = T.zeros((n_samples, context.shape[2]),
+                            dtype=theano.config.floatX)
+    init_att = T.zeros((n_samples, context.shape[0]),
+                        dtype=theano.config.floatX)
+    # Scan cannot handle batch sizes of 1?
+    # Unbroadcast can fix it... but still weird
+    #https://github.com/Theano/Theano/issues/1772
+    #init_context = T.unbroadcast(init_context, 0)
+    #init_att = T.unbroadcast(init_att, 0)
+
+    if one_step:
+        rval = step(x, mask, init_state, init_memory, None, None,
+                    projected_context)
+    else:
+        rval, _ = theano.scan(step,
+                              sequences=[x, mask],
+                              outputs_info=[init_state, init_memory,
+                                            init_context, init_att,
+                                            None, None, None, None, None],
+                              non_sequences=[projected_context,],
+                              n_steps=n_steps)
+
+    #hidden = rval[0]
+    #state = rval[1]
+    #final_context = rval[2]
+    #final_att = rval[3]
+    return rval[:4], params
+
+
+def init_recurrent_lstm_layer(input_size, hidden_size, output_size,
+                              random_state):
+    # input to LSTM
+    W_ = np.concatenate(
+        [np_rand((input_size, hidden_size), random_state),
+         np_rand((input_size, hidden_size), random_state),
+         np_rand((input_size, hidden_size), random_state),
+         np_rand((input_size, hidden_size), random_state)],
+        axis=1)
+
+    W = theano.shared(W_, borrow=True)
+
+    # LSTM to LSTM
+    U_ = np.concatenate(
+        [np_ortho((hidden_size, hidden_size), random_state),
+         np_ortho((hidden_size, hidden_size), random_state),
+         np_ortho((hidden_size, hidden_size), random_state),
+         np_ortho((hidden_size, hidden_size), random_state)],
+        axis=1)
+
+    U = theano.shared(U_, borrow=True)
+
+    # bias to LSTM
+    b = shared_zeros((4 * hidden_size,))
+
+    params = [W, U, b]
+    return params
+
+
+def build_recurrent_lstm_layer(input_size, hidden_size, output_size,
+                               input_variable, mask,
+                               random_state, one_step=False):
+    params = init_recurrent_lstm_layer(input_size, hidden_size, output_size,
+                                       random_state)
+    return build_recurrent_lstm_layer_from_params(params, input_variable, mask,
+                                                  random_state,
+                                                  one_step=one_step)
+
+
+def build_recurrent_lstm_layer_from_params(params, input_variable, mask,
+                                           random_state, one_step=False):
+    [W, U, b] = params
+
+    hidden_size = U.shape[0]
+
+    n_steps = input_variable.shape[0]
+    n_samples = input_variable.shape[1]
+    n_features = input_variable.shape[2]
+
+    def _slice(X, n, hidden_size):
+        # Function is needed because tensor size changes across calls to step?
+        if X.ndim == 3:
+            return X[:, :, n * hidden_size:(n + 1) * hidden_size]
+        return X[:, n * hidden_size:(n + 1) * hidden_size]
+
+    def step(x_t, m, h_tm1, c_tm1):
+        preactivation = T.dot(h_tm1, U)
+        preactivation += x_t
+        preactivation += b
+
+        i_t = T.nnet.sigmoid(_slice(preactivation, 0, hidden_size))
+        f_t = T.nnet.sigmoid(_slice(preactivation, 1, hidden_size))
+        o_t = T.nnet.sigmoid(_slice(preactivation, 2, hidden_size))
+        c_t = T.tanh(_slice(preactivation, 3, hidden_size))
+
+        c_t = f_t * c_tm1 + i_t * c_t
+        c_t = m[:, None] * c_t + (1. - m)[:, None] * c_tm1
+        h_t = o_t * T.tanh(c_t)
+        h_t = m[:, None] * h_t + (1. - m)[:, None] * h_tm1
+        return h_t, c_t, i_t, f_t, o_t, preactivation
+
+    # Scan cannot handle batch sizes of 1?
+    # Unbroadcast can fix it... but still weird
+    #https://github.com/Theano/Theano/issues/1772
+    init_hidden = T.zeros((n_samples, hidden_size))
+    init_cell = T.zeros((n_samples, hidden_size))
+    init_hidden = T.unbroadcast(init_hidden, 0)
+    init_cell = T.unbroadcast(init_cell, 0)
+
+    x = T.dot(input_variable, W) + b
+    if one_step:
+        rval = step(x, mask, init_hidden, init_cell)
+    else:
+        rval, _ = theano.scan(step,
+                              sequences=[x, mask],
+                              outputs_info=[init_hidden, init_cell,
+                                            None, None, None, None],
+                              n_steps=n_steps)
+
+    hidden = rval[0]
+    return hidden, params
+
+
+def recurrence_relation(size):
+    """
+    Based on code from Shawn Tan
+    """
+
+    eye2 = T.eye(size + 2)
+    return T.eye(size) + eye2[2:, 1:-1] + eye2[2:, :-2] * (T.arange(size) % 2)
+
+
+def path_probs(predict, y_sym):
+    """
+    Based on code from Rakesh - blank is assumed to be highest class in y_sym
+    """
+    pred_y = predict[:, y_sym]
+    rr = recurrence_relation(y_sym.shape[0])
+
+    def step(p_curr, p_prev):
+        return p_curr * T.dot(p_prev, rr)
+
+    probabilities, _ = theano.scan(
+        step,
+        sequences=[pred_y],
+        outputs_info=[T.eye(y_sym.shape[0])[0]]
+    )
+    return probabilities
+
+
+def _epslog(X):
+    return T.cast(T.log(T.clip(X, 1E-12, 1E12)), theano.config.floatX)
+
+
+def log_path_probs(y_hat_sym, y_sym):
+    """
+    Based on code from Shawn Tan with calculations in log space
+    """
+    pred_y = y_hat_sym[:, y_sym]
+    rr = recurrence_relation(y_sym.shape[0])
+
+    def step(logp_curr, logp_prev):
+        return logp_curr + _epslog(T.dot(T.exp(logp_prev), rr))
+
+    log_probs, _ = theano.scan(
+        step,
+        sequences=[_epslog(pred_y)],
+        outputs_info=[_epslog(T.eye(y_sym.shape[0])[0])]
+    )
+    return log_probs
+
+
+def ctc_cost(y_hat_sym, y_sym):
+    """
+    Based on code from Shawn Tan
+    """
+    forward_probs = path_probs(y_hat_sym, y_sym)
+    backward_probs = path_probs(y_hat_sym[::-1], y_sym[::-1])[::-1, ::-1]
+    probs = forward_probs * backward_probs / y_hat_sym[:, y_sym]
+    total_probs = T.sum(probs)
+    return -T.log(total_probs)
+
+
+def log_ctc_cost(y_hat_sym, y_sym):
+    """
+    Based on code from Shawn Tan with sum calculations in log space
+    """
+    log_forward_probs = log_path_probs(y_hat_sym, y_sym)
+    log_backward_probs = log_path_probs(
+        y_hat_sym[::-1], y_sym[::-1])[::-1, ::-1]
+    log_probs = log_forward_probs + log_backward_probs - _epslog(
+        y_hat_sym[:, y_sym])
+    log_probs = log_probs.flatten()
+    max_log = T.max(log_probs)
+    # Stable logsumexp
+    loss = max_log + T.log(T.sum(T.exp(log_probs - max_log)))
+    return -loss
+
+
+def rnn_check_array(X, y=None):
+    if type(X) == np.ndarray and len(X.shape) == 2:
+        X = [X.astype(theano.config.floatX)]
+    elif type(X) == np.ndarray and len(X.shape) == 3:
+        X = X.astype(theano.config.floatX)
+    elif type(X) == list:
+        if type(X[0]) == np.ndarray and len(X[0].shape) == 2:
+            X = [x.astype(theano.config.floatX) for x in X]
+        else:
+            raise ValueError("X must be a 2D numpy array or an"
+                             "iterable of 2D numpy arrays")
+    try:
+        X[0].shape[1]
+    except AttributeError:
+        raise ValueError("X must be a 2D numpy array or an"
+                         "iterable of 2D numpy arrays")
+
+    if y is not None:
+        if type(y) == np.ndarray and len(y.shape) == 1:
+            y = [y.astype('int32')]
+        elif type(y) == np.ndarray and len(y.shape) == 2:
+            y = y.astype('int32')
+        elif type(y) == list:
+            if type(y[0]) == np.ndarray and len(y[0].shape) == 1:
+                y = [yi.astype('int32') for yi in y]
+            elif type(y[0]) != np.ndarray:
+                y = [np.asarray(y).astype('int32')]
+        try:
+            y[0].shape[0]
+        except AttributeError:
+            raise ValueError("y must be an iterable of 1D numpy arrays")
+        return X, y
+    else:
+        # If y is not passed don't return it
+        return X
+
+
+class RecurrentNetwork(PickleMixin, TrainingMixin):
+    def __init__(self, hidden_layer_sizes=[100], max_iter=1E2,
+                 learning_rate=0.01, momentum=0., learning_alg="sgd",
+                 recurrent_activation="lstm", minibatch_size=1,
+                 bidirectional=False, cost="softmax", save_frequency=10,
+                 model_save_name="saved_model", random_seed=None,
+                 input_checking=True):
+        if random_seed is None or type(random_seed) is int:
+            self.random_state = np.random.RandomState(random_seed)
+        self.learning_rate = learning_rate
+        self.learning_alg = learning_alg
+        self.momentum = momentum
+        self.bidirectional = bidirectional
+        self.cost = cost
+        self.hidden_layer_sizes = hidden_layer_sizes
+        self.max_iter = int(max_iter)
+        self.minibatch_size = minibatch_size
+        self.save_frequency = save_frequency
+        self.model_save_name = model_save_name
+        self.recurrent_activation = recurrent_activation
+        self.input_checking = input_checking
+        if recurrent_activation == "lstm":
+            self.recurrent_function = build_recurrent_lstm_layer
+        else:
+            raise ValueError("Value %s not understood for recurrent_activation"
+                             % recurrent_activation)
+
+    def _setup_functions(self, X_sym, y_sym, X_mask, y_mask, layer_sizes):
+        input_variable = X_sym
+
+        # layer_sizes consists of input size, all hidden sizes, and output size
+        hidden_sizes = layer_sizes[1:-1]
+        # set these to stop pep8 vim plugin from complaining
+        input_size = None
+        output_size = None
+        for n in range(len(hidden_sizes)):
+            if (n - 1) < 0:
+                input_size = layer_sizes[0]
+            else:
+                if self.bidirectional:
+                    # Accomodate for concatenated hiddens
+                    input_size = 2 * output_size
+                else:
+                    input_size = output_size
+            hidden_size = hidden_sizes[n]
+            if (n + 1) != len(hidden_sizes):
+                output_size = hidden_sizes[n + 1]
+            else:
+                output_size = layer_sizes[-1]
+
+            forward_hidden, forward_params = self.recurrent_function(
+                input_size, hidden_size, output_size, input_variable, X_mask,
+                self.random_state)
+
+            if self.bidirectional:
+                backward_hidden, backward_params = self.recurrent_function(
+                    input_size, hidden_size, output_size, input_variable[::-1],
+                    X_mask[::-1], self.random_state)
+                params = forward_params + backward_params
+                input_variable = concatenate(
+                    [forward_hidden, backward_hidden[::-1]],
+                    axis=forward_hidden.ndim - 1)
+            else:
+                params = forward_params
+                input_variable = forward_hidden
+
+        if self.bidirectional:
+            # Accomodate for concatenated hiddens
+            sz = 2 * hidden_sizes[-1]
+        else:
+            sz = hidden_sizes[-1]
+
+        if self.cost == "softmax":
+            # easy mode
+            output, output_params = build_linear_layer(sz, output_size,
+                                                       input_variable,
+                                                       self.random_state)
+            params = params + output_params
+            shp = output.shape
+            output = output.reshape([shp[0] * shp[1], shp[2]])
+            y_hat_sym = T.nnet.softmax(output)
+            y_sym_reshaped = y_sym.reshape([shp[0] * shp[1], shp[2]])
+            cost = -T.mean((y_sym_reshaped * T.log(y_hat_sym)).sum(axis=1))
+
+        elif self.cost == "encdec":
+            # hardmode
+            context = input_variable
+            context_mean = context[0]
+
+            init_state, state_params = build_tanh_layer(sz, hidden_sizes[-1],
+                                                        context_mean,
+                                                        self.random_state)
+            init_memory, memory_params = build_tanh_layer(sz, hidden_sizes[-1],
+                                                          context_mean,
+                                                          self.random_state)
+            # partial sampler setup
+            self._encode = theano.function([X_sym, X_mask],
+                                           [init_state, init_memory, context])
+            init_state_sampler = T.matrix()
+            init_memory_sampler = T.matrix()
+            y_sw_sampler = T.tensor3()
+            y_sw_mask = T.alloc(1., y_sw_sampler.shape[0], 1)
+
+            # need this style of init to reuse params for sampler and actual
+            # training. This makes this part quite nasty - dictionary
+            # for initialization and params is making more and more sense.
+            # conditional params will be reused below
+            conditional_params = init_recurrent_conditional_lstm_layer(
+                output_size, hidden_sizes[-1], sz, self.random_state)
+
+            rval, _p = build_recurrent_conditional_lstm_layer_from_params(
+                conditional_params, y_sw_sampler, y_sw_mask, context, X_mask,
+                init_state_sampler, init_memory_sampler,
+                self.random_state, one_step=True)
+            next_state, next_memory, sampler_contexts, _ = rval
+            #end sampler parts... for now
+
+            params = params + state_params + memory_params
+            shifted_labels = T.zeros_like(y_sym)
+            shifted_labels = T.set_subtensor(shifted_labels[1:], y_sym[:-1])
+            y_sym = shifted_labels
+
+            rval, _p = build_recurrent_conditional_lstm_layer_from_params(
+                conditional_params, shifted_labels, y_mask, context, X_mask,
+                init_state, init_memory, self.random_state)
+            projected_hidden, _, contexts, attention = rval
+
+            params = params + conditional_params
+
+            # once again, need to use same params for sample gen
+            lh_params = init_linear_layer(hidden_sizes[-1], output_size,
+                                          self.random_state)
+            logit_hidden, _ = build_linear_layer_from_params(lh_params,
+                                                             projected_hidden)
+            params = params + lh_params
+
+            lo_params = init_linear_layer(output_size, output_size,
+                                          self.random_state)
+            logit_out, _ = build_linear_layer_from_params(lo_params,
+                                                             y_sym)
+            params = params + lo_params
+
+            lc_params = init_linear_layer(sz, output_size,
+                                          self.random_state)
+            logit_contexts, _ = build_linear_layer_from_params(lc_params,
+                                                               contexts)
+            params = params + lc_params
+
+            logit = T.tanh(logit_hidden + logit_out + logit_contexts)
+            output_params = init_linear_layer(output_size, output_size,
+                                              self.random_state)
+            output, _ = build_linear_layer_from_params(output_params,
+                                                       logit)
+            params = params + output_params
+
+            shp = output.shape
+            output = output.reshape([shp[0] * shp[1], shp[2]])
+            y_hat_sym = T.nnet.softmax(output)
+
+            # Need to apply mask so that cost isn't punished
+            y_sym_reshaped = (y_sym * y_mask.dimshuffle(0, 1, 'x')).reshape(
+                [shp[0] * shp[1], shp[2]])
+            y_sym_reshaped = y_sym.reshape([shp[0] * shp[1], shp[2]])
+            cost = -T.mean((y_sym_reshaped * T.log(y_hat_sym)).sum(axis=1))
+
+            # Finish sampler
+            logit_sampler_hidden, _ = build_linear_layer_from_params(lh_params,
+                                                                     next_state)
+            logit_sampler_out, _ = build_linear_layer_from_params(lo_params,
+                                                                  y_sw_sampler)
+            logit_sampler_contexts, _ = build_linear_layer_from_params(
+                lc_params, sampler_contexts)
+            logit_sampler = T.tanh(logit_sampler_hidden + logit_sampler_out
+                                   + logit_sampler_contexts)
+            output_sampler, _ = build_linear_layer_from_params(output_params,
+                                                       logit_sampler)
+            shp = output_sampler.shape
+            output_sampler = output_sampler.reshape([shp[0] * shp[1], shp[2]])
+            y_hat_sampler = T.nnet.softmax(output_sampler)
+            self._sampler_step = theano.function(
+                [y_sw_sampler, context, X_mask, init_state_sampler,
+                 init_memory_sampler],
+                [y_hat_sampler, next_state, next_memory])
+
+        else:
+            raise ValueError("Value of %s not a valid cost!"
+                             % self.cost)
+
+        self.params_ = params
+
+        if self.learning_alg == "sgd":
+            updates = self.get_clip_sgd_updates(
+                X_sym, y_sym, params, cost, self.learning_rate, self.momentum)
+        elif self.learning_alg == "rmsprop":
+            updates = self.get_clip_rmsprop_updates(
+                X_sym, y_sym, params, cost, self.learning_rate, self.momentum)
+        elif self.learning_alg == "sfg":
+            updates = self.get_sfg_updates(
+                X_sym, y_sym, params, cost, self.learning_rate, self.momentum)
+        else:
+            raise ValueError("Value of %s not a valid learning_alg!"
+                             % self.learning_alg)
+
+        if self.cost == "softmax":
+            self.fit_function = theano.function(inputs=[X_sym, y_sym, X_mask,
+                                                        y_mask],
+                                                outputs=cost,
+                                                updates=updates,
+                                                on_unused_input="ignore")
+
+            self.loss_function = theano.function(inputs=[X_sym, y_sym, X_mask,
+                                                        y_mask],
+                                                outputs=cost,
+                                                on_unused_input="ignore")
+
+            self.predict_function = theano.function(
+                inputs=[X_sym, X_mask],
+                outputs=y_hat_sym,
+                on_unused_input="ignore")
+
+        else:
+            self.fit_function = theano.function(inputs=[X_sym, y_sym, X_mask,
+                                                        y_mask],
+                                                outputs=cost,
+                                                updates=updates,
+                                                on_unused_input="warn")
+
+            self.loss_function = theano.function(inputs=[X_sym, y_sym, X_mask,
+                                                        y_mask],
+                                                outputs=cost,
+                                                on_unused_input="warn")
+
+            self.predict_function = theano.function(
+                inputs=[X_sym, X_mask, y_sym, y_mask],
+                outputs=y_hat_sym)
+
+    def encode(self, X):
+        X = rnn_check_array(X)
+        encodings = []
+        for n in range(len(X)):
+            X_n = X[n][None].transpose(1, 0, 2)
+            X_mask = np.ones((len(X_n), 1)).astype(theano.config.floatX)
+            enc, state, memory = self._encode(X_n, X_mask)
+            encodings.append(enc)
+        return encodings
+
+    def fit(self, X, y, valid_X=None, valid_y=None):
+        if self.input_checking:
+            X, y = rnn_check_array(X, y)
+        input_size = X[0].shape[1]
+        # Assume that class values are sequential! and start from 0
+        highest_class = np.max([np.max(d) for d in y])
+        lowest_class = np.min([np.min(d) for d in y])
+        if lowest_class != 0:
+            raise ValueError("Labels must start from 0!")
+        # Create a list of all classes, then get uniques
+        # sum(lists, []) is list concatenation
+        all_classes = np.unique(sum([list(np.unique(d)) for d in y], []))
+        # +1 to include endpoint
+        output_size = len(np.arange(lowest_class, highest_class + 1))
+        X_sym = T.tensor3('x')
+        y_sym = T.tensor3('y')
+        X_mask = T.matrix('x_mask')
+        y_mask = T.matrix('y_mask')
+
+        self.layers_ = []
+        self.layer_sizes_ = [input_size]
+        self.layer_sizes_.extend(self.hidden_layer_sizes)
+        self.layer_sizes_.append(output_size)
+        if not hasattr(self, 'fit_function'):
+            print("Building model!")
+            self._setup_functions(X_sym, y_sym, X_mask, y_mask,
+                                  self.layer_sizes_)
+        self.training_loss_ = []
+        if valid_X is not None:
+            self.validation_loss_ = []
+            if self.input_checking:
+                valid_X, valid_y = rnn_check_array(valid_X, valid_y)
+                for vy in valid_y:
+                    if not np.in1d(np.unique(vy), all_classes).all():
+                        raise ValueError(
+                            "Validation set contains classes not in training"
+                            "set! Training set classes: %s\n, Validation set \
+                             classes: %s" % (all_classes, np.unique(vy)))
+
+        best_valid_loss = np.inf
+        for itr in range(self.max_iter):
+            print("Starting pass %d through the dataset" % itr)
+            total_train_loss = 0
+            for i, j in minibatch_indices(X, self.minibatch_size):
+                X_n, y_n, X_mask, y_mask = make_minibatch(X[i:j], y[i:j],
+                                                          output_size)
+                train_loss = self.fit_function(X_n, y_n, X_mask, y_mask)
+                total_train_loss += train_loss
+            current_train_loss = total_train_loss / len(X)
+            print("Training loss %f" % current_train_loss)
+            self.training_loss_.append(current_train_loss)
+
+            if (itr % self.save_frequency) == 0 or (itr == self.max_iter):
+                f = open(self.model_save_name + "_snapshot.pkl", 'wb')
+                cPickle.dump(self, f, protocol=2)
+                f.close()
+
+            if valid_X is not None:
+                total_valid_loss = 0
+                for i, j in minibatch_indices(valid_X, self.minibatch_size):
+                    valid_X_n, valid_y_n, X_mask, y_mask = make_minibatch(
+                        valid_X[i:j], valid_y[i:j], output_size)
+                    valid_loss = self.loss_function(valid_X_n, valid_y_n,
+                                                    X_mask, y_mask)
+                    total_valid_loss += valid_loss
+                current_valid_loss = total_valid_loss / len(valid_X)
+                print("Validation loss %f" % current_valid_loss)
+                self.validation_loss_.append(current_valid_loss)
+                if current_valid_loss < best_valid_loss:
+                    best_valid_loss = current_valid_loss
+                    f = open(self.model_save_name + "_best.pkl", 'wb')
+                    cPickle.dump(self, f, protocol=2)
+                    f.close()
+
+
+    def predict(self, X):
+        raise ValueError("Not yet implemented!")
+        X = rnn_check_array(X)
+        predictions = []
+        for n in range(len(X)):
+            X_n = X[n][None].transpose(1, 0, 2)
+            X_mask = np.ones((len(X_n), 1)).astype(theano.config.floatX)
+            pred = np.argmax(self.predict_function(X_n, X_mask)[0], axis=1)
+            predictions.append(pred)
+        return predictions
+
+    def predict_proba(self, X):
+        raise ValueError("Not yet implemented!")
+        X = rnn_check_array(X)
+        predictions = []
+        for n in range(len(X)):
+            X_n = X[n][None].transpose(1, 0, 2)
+            X_mask = np.ones((len(X_n), 1)).astype(theano.config.floatX)
+            pred = self.predict_function(X_n, X_mask)[0]
+            predictions.append(pred)
+        return predictions
