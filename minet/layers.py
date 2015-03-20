@@ -362,12 +362,11 @@ def build_recurrent_lstm_layer(input_size, hidden_size, output_size,
 def build_recurrent_lstm_layer_from_params(params, input_variable, mask,
                                            random_state, one_step=False):
     [W, U, b] = params
-
     hidden_size = U.shape[0]
 
     n_steps = input_variable.shape[0]
     n_samples = input_variable.shape[1]
-    # n_features = input_variable.shape[2]
+    n_features = input_variable.shape[2]
 
     def _slice(X, n, hidden_size):
         # Function is needed because tensor size changes across calls to step?

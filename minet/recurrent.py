@@ -5,16 +5,15 @@ try:
 except ImportError:
     import pickle as cPickle
 import numpy as np
-from scipy import linalg
 import theano
 import theano.tensor as T
 from utils import PickleMixin, TrainingMixin, minibatch_indices, make_minibatch
+from utils import make_regression
 from extmath import logsumexp
 from layers import concatenate, build_recurrent_lstm_layer, build_linear_layer
 from layers import build_tanh_layer, init_recurrent_conditional_lstm_layer
 from layers import build_recurrent_conditional_lstm_layer_from_params
 from layers import init_linear_layer, build_linear_layer_from_params
-import copy
 
 
 def rnn_check_array(X, y=None):
@@ -215,6 +214,7 @@ class _BaseRNN(PickleMixin, TrainingMixin):
                 params = forward_params
                 input_variable = forward_hidden
 
+
         if self.bidirectional:
             # Accomodate for concatenated hiddens
             sz = 2 * hidden_sizes[-1]
@@ -271,7 +271,8 @@ class RNN(_BaseRNN):
 
 
 class GMMRNN(_BaseRNN):
-    def __init__(self, hidden_layer_sizes=[100], n_mixture_components=20,
+    def __init__(self, hidden_layer_sizes=[100], window_size=15,
+                 prediction_size=5, n_mixture_components=20,
                  max_iter=1E2, learning_rate=0.01, momentum=0.,
                  learning_alg="sgd", recurrent_activation="lstm",
                  minibatch_size=1, bidirectional=False, save_frequency=10,
@@ -284,6 +285,8 @@ class GMMRNN(_BaseRNN):
         self.momentum = momentum
         self.bidirectional = bidirectional
         self.hidden_layer_sizes = hidden_layer_sizes
+        self.window_size = window_size
+        self.prediction_size = prediction_size
         self.n_mixture_components = n_mixture_components
         self.max_iter = int(max_iter)
         self.minibatch_size = minibatch_size
@@ -302,49 +305,48 @@ class GMMRNN(_BaseRNN):
         # n_samples
         # n_timesteps
         # n_features
-        y = copy.deepcopy(X[:, 1:])
-        X = copy.deepcopy(X[:, :-1])
-        if valid_X is not None:
-            valid_y = copy.deepcopy(valid_X[:, 1:])
-            valid_X = copy.deepcopy(valid_X[:, :-1])
-
         if self.input_checking:
             X = rnn_check_array(X)
-            y = rnn_check_array(y)
-        input_size = X[0].shape[1]
-        output_size = y[0].shape[1]
-        if input_size != output_size:
-            raise ValueError("This is a regression network! X[0].shape[1]"
-                             "%i and y[0].shape[1] %i mismatched!" % (
-                                 input_size, output_size))
+
+        self.n_features = X[0].shape[-1]
+
+        # Regression features
+        input_size = self.window_size
+        output_size = self.prediction_size
         self.input_size_ = input_size
         self.output_size_ = output_size
         X_sym = T.tensor3('x')
         y_sym = T.tensor3('y')
-        X_mask = T.matrix('x_mask')
-        y_mask = T.matrix('y_mask')
+        X_mask_sym = T.matrix('x_mask')
+        y_mask_sym = T.matrix('y_mask')
 
         self.layers_ = []
         self.layer_sizes_ = [input_size]
         self.layer_sizes_.extend(self.hidden_layer_sizes)
         self.layer_sizes_.append(output_size)
-        if not hasattr(self, 'fit_function'):
-            print("Building model!")
-            self._setup_functions(X_sym, y_sym, X_mask, y_mask,
-                                  self.layer_sizes_)
+
         self.training_loss_ = []
         if valid_X is not None:
             self.validation_loss_ = []
             if self.input_checking:
-                valid_X, valid_y = rnn_check_array(valid_X, valid_y)
+                valid_X = rnn_check_array(valid_X)
 
         best_valid_loss = np.inf
         for itr in range(self.max_iter):
             print("Starting pass %d through the dataset" % itr)
             total_train_loss = 0
             for i, j in minibatch_indices(X, self.minibatch_size):
-                X_n, y_n, X_mask, y_mask = make_minibatch(X[i:j], y[i:j],
-                                                          output_size)
+                X_n, y_n, X_mask, y_mask = make_regression(
+                    X[i:j], self.window_size, self.prediction_size)
+                if not hasattr(self, 'fit_function'):
+                    # This is here to make debugging easier
+                    X_sym.tag.test_value = X_n
+                    y_sym.tag.test_value = y_n
+                    X_mask_sym.tag.test_value = X_mask
+                    y_mask_sym.tag.test_value = y_mask
+                    print("Building model!")
+                    self._setup_functions(X_sym, y_sym, X_mask_sym, y_mask_sym,
+                                          self.layer_sizes_)
                 train_loss = self.fit_function(X_n, y_n, X_mask, y_mask)
                 total_train_loss += train_loss
             current_train_loss = total_train_loss / len(X)
@@ -359,8 +361,9 @@ class GMMRNN(_BaseRNN):
             if valid_X is not None:
                 total_valid_loss = 0
                 for i, j in minibatch_indices(valid_X, self.minibatch_size):
-                    valid_X_n, valid_y_n, X_mask, y_mask = make_minibatch(
-                        valid_X[i:j], valid_y[i:j])
+                    valid_X_n, valid_y_n, _, _ = make_regression(
+                        valid_X[i:j], self.window_size,
+                        self.prediction_size)
                     valid_loss = self.loss_function(valid_X_n, valid_y_n)
                     total_valid_loss += valid_loss
                 current_valid_loss = total_valid_loss / len(valid_X)
@@ -414,12 +417,13 @@ class GMMRNN(_BaseRNN):
                                   coeff.shape[-1]])
 
         # Calculate GMM cost with minimum sigma tolerance
-        log_var = T.log(T.exp(log_var) + 1E-8)
+        log_var = T.log(T.exp(log_var) + 1E-20)
         cost = -0.5 * T.sum(T.sqr(y_r - mu) * T.exp(-log_var) + log_var
                            + T.log(2 * np.pi), axis=1)
         cost = -logsumexp(T.log(coeff) + cost, axis=1).sum()
         self.params_ = params
         updates = self._updates(X_sym, y_sym, params, cost)
+
 
         self.fit_function = theano.function(inputs=[X_sym, y_sym, X_mask,
                                                     y_mask],
@@ -436,17 +440,18 @@ class GMMRNN(_BaseRNN):
                                                  outputs=[mu, log_var, coeff],
                                                  on_unused_input="ignore")
 
-    def _gen_next_sample(self, X, random_state):
+    def _gen_next_samples(self, X, random_state):
         X_n, _, X_mask, _ = make_minibatch(X, X, X.shape[1])
+        X_n = X_n.transpose(1, 2, 0)
+        X_mask = np.ones((X_n.shape[0], X_n.shape[1]),
+                         dtype=theano.config.floatX)
         r = self.generate_function(X_n, X_mask)
-        shp = X_n.shape
-        mu = r[0].reshape(shp[0], shp[1], shp[2], -1)
-        log_var = r[1].reshape(shp[0], shp[1], shp[2], -1)
-        coeff = r[2].reshape(shp[0], self.n_mixture_components)
-        mu = mu[-1, 0]
-        log_var = log_var[-1, 0]
-        coeff = coeff[-1]
+        mu = r[0][0]
+        log_var = r[1][0]
+        coeff = r[2][0]
+        # summed
         coeff = coeff / coeff.sum()
+        # Choice sample
         #k = np.where(random_state.rand() < coeff.cumsum())[0][0]
         #s = random_state.randn(mu.shape[0]) * np.sqrt(
         #    np.exp(log_var[:, k])) + mu[:, k]
@@ -460,22 +465,25 @@ class GMMRNN(_BaseRNN):
             random_state = self.random_state
         else:
             random_state = np.random.RandomState(random_seed)
-        samples = np.zeros((n_steps, self.input_size_))
+        samples = np.zeros((n_steps, self.n_features))
         if init_seed is None:
-            s = random_state.rand(self.input_size_)
-            samples[0] = s
-            start = 1
+            s = random_state.rand(self.window_size, self.n_features)
+            samples[:self.window_size] = s
+            start = self.window_size
         else:
             s = init_seed
+            if len(s) < self.window_size:
+                raise ValueError("init_seed size too small! Must be longer than"
+                                 "window_size %i" % self.window_size)
             samples[:len(s)] = s
             start = len(s)
-        for n in range(start, n_steps):
-            X_n = rnn_check_array(samples[:n][None])
-            s = self._gen_next_sample(X_n, random_state)
-            samples[n] = s
+        for n in range(start, n_steps, self.prediction_size):
+            X_n = rnn_check_array(samples[n - self.window_size:n][None])
+            s = self._gen_next_samples(X_n, random_state)
+            samples[n:n + len(s)] = s.reshape((self.prediction_size,
+                                              self.n_features))
         # slice back to 2D
         return np.array(samples)
-
 
     def force_sample(self, X, random_seed=None):
         if len(X.shape) != 2:
@@ -484,11 +492,13 @@ class GMMRNN(_BaseRNN):
             random_state = self.random_state
         else:
             random_state = np.random.RandomState(random_seed)
-        samples = np.zeros((X.shape[0], self.input_size_))
-        samples[0] = X[0]
-        for n in range(1, len(X)):
-            X_n = rnn_check_array(X[:n][None])
-            samples[n] = self._gen_next_sample(X_n, random_state)
+        samples = np.zeros((X.shape[0], self.n_features))
+        samples[:self.window_size] = X[:self.window_size]
+        for n in range(self.window_size, len(X), self.prediction_size):
+            X_n = rnn_check_array(X[n - self.window_size:n][None])
+            s = self._gen_next_samples(X_n, random_state)
+            samples[n:n + len(s)] = s.reshape((self.prediction_size,
+                                              self.n_features))
         return np.array(samples)
 
 
