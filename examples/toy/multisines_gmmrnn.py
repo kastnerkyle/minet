@@ -13,7 +13,7 @@ sin = np.sin(np.linspace(-3 * np.pi, 3 * np.pi, time_steps))[:, None]
 cos = np.cos(np.linspace(-3 * np.pi, 3 * np.pi, time_steps))[:, None]
 seq = np.concatenate((sin, cos), axis=-1)[None]
 
-clf = GMMRNN(learning_alg="rmsprop", n_mixture_components=4,
+clf = GMMRNN(learning_alg="rmsprop", n_mixture_components=20,
              hidden_layer_sizes=[n_h],
              max_iter=1000, learning_rate=.0001,
              bidirectional=False, momentum=0.99,

@@ -12,7 +12,7 @@ random_state = np.random.RandomState(1999)
 sin = np.sin(np.linspace(-3 * np.pi, 3 * np.pi, time_steps))
 seq = sin[None, :, None]
 
-clf = GMMRNN(learning_alg="rmsprop", n_mixture_components=2,
+clf = GMMRNN(learning_alg="rmsprop", n_mixture_components=20,
              hidden_layer_sizes=[n_h],
              max_iter=1000, learning_rate=.0001,
              bidirectional=False, momentum=0.99,

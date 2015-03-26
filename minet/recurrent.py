@@ -158,8 +158,8 @@ class _BaseRNN(PickleMixin, TrainingMixin):
         X = rnn_check_array(X)
         predictions = []
         for n in range(len(X)):
-            X_mask = np.ones((len(X_n), 1)).astype(theano.config.floatX)
-            pred = np.argmax(self.predict_function(X_n, X_mask)[0], axis=1)
+            X_mask = np.ones((len(X[n]), 1)).astype(theano.config.floatX)
+            pred = np.argmax(self.predict_function(X[n], X_mask)[0], axis=1)
             predictions.append(pred)
         return predictions
 
