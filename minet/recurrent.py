@@ -158,7 +158,6 @@ class _BaseRNN(PickleMixin, TrainingMixin):
         X = rnn_check_array(X)
         predictions = []
         for n in range(len(X)):
-            X_n = X[n][None].transpose(1, 0, 2)
             X_mask = np.ones((len(X_n), 1)).astype(theano.config.floatX)
             pred = np.argmax(self.predict_function(X_n, X_mask)[0], axis=1)
             predictions.append(pred)
@@ -175,7 +174,7 @@ class _BaseRNN(PickleMixin, TrainingMixin):
             predictions.append(pred)
         return predictions
 
-    def _stack_layers(self, X_sym, X_mask, layer_sizes):
+    def _stack_layers(self, X_sym, X_mask, layer_sizes, one_step=False):
         input_variable = X_sym
 
         # layer_sizes consists of input size, all hidden sizes, and output size
@@ -200,12 +199,12 @@ class _BaseRNN(PickleMixin, TrainingMixin):
 
             forward_hidden, forward_params = self.recurrent_activation(
                 input_size, hidden_size, output_size, input_variable, X_mask,
-                self.random_state)
+                self.random_state, one_step=one_step)
 
             if self.bidirectional:
                 backward_hidden, backward_params = self.recurrent_activation(
                     input_size, hidden_size, output_size, input_variable[::-1],
-                    X_mask[::-1], self.random_state)
+                    X_mask[::-1], self.random_state, one_step=one_step)
                 params = forward_params + backward_params
                 input_variable = concatenate(
                     [forward_hidden, backward_hidden[::-1]],
@@ -220,7 +219,7 @@ class _BaseRNN(PickleMixin, TrainingMixin):
             sz = 2 * hidden_sizes[-1]
         else:
             sz = hidden_sizes[-1]
-        return input_variable, params, sz, input_size, hidden_sizes, output_size
+        return input_variable, params, sz, input_size, hidden_sizes
 
     def _updates(self, X_sym, y_sym, params, cost):
         if self.learning_alg == "sgd":
@@ -271,8 +270,7 @@ class RNN(_BaseRNN):
 
 
 class GMMRNN(_BaseRNN):
-    def __init__(self, hidden_layer_sizes=[100], window_size=15,
-                 prediction_size=5, n_mixture_components=20,
+    def __init__(self, hidden_layer_sizes=[100], n_mixture_components=20,
                  max_iter=1E2, learning_rate=0.01, momentum=0.,
                  learning_alg="sgd", recurrent_activation="lstm",
                  minibatch_size=1, bidirectional=False, save_frequency=10,
@@ -285,8 +283,6 @@ class GMMRNN(_BaseRNN):
         self.momentum = momentum
         self.bidirectional = bidirectional
         self.hidden_layer_sizes = hidden_layer_sizes
-        self.window_size = window_size
-        self.prediction_size = prediction_size
         self.n_mixture_components = n_mixture_components
         self.max_iter = int(max_iter)
         self.minibatch_size = minibatch_size
@@ -311,19 +307,17 @@ class GMMRNN(_BaseRNN):
         self.n_features = X[0].shape[-1]
 
         # Regression features
-        input_size = self.window_size
-        output_size = self.prediction_size
-        self.input_size_ = input_size
-        self.output_size_ = output_size
+        self.input_size_ = self.n_features
+        self.output_size_ = self.n_features
         X_sym = T.tensor3('x')
         y_sym = T.tensor3('y')
         X_mask_sym = T.matrix('x_mask')
         y_mask_sym = T.matrix('y_mask')
 
         self.layers_ = []
-        self.layer_sizes_ = [input_size]
+        self.layer_sizes_ = [self.input_size_]
         self.layer_sizes_.extend(self.hidden_layer_sizes)
-        self.layer_sizes_.append(output_size)
+        self.layer_sizes_.append(self.output_size_)
 
         self.training_loss_ = []
         if valid_X is not None:
@@ -336,8 +330,7 @@ class GMMRNN(_BaseRNN):
             print("Starting pass %d through the dataset" % itr)
             total_train_loss = 0
             for i, j in minibatch_indices(X, self.minibatch_size):
-                X_n, y_n, X_mask, y_mask = make_regression(
-                    X[i:j], self.window_size, self.prediction_size)
+                X_n, y_n, X_mask, y_mask = make_regression(X[i:j])
                 if not hasattr(self, 'fit_function'):
                     # This is here to make debugging easier
                     X_sym.tag.test_value = X_n
@@ -376,23 +369,34 @@ class GMMRNN(_BaseRNN):
                     f.close()
 
     def _setup_functions(self, X_sym, y_sym, X_mask, y_mask, layer_sizes):
-        (input_variable, params, sz, input_size, hidden_sizes,
-         output_size) = self._stack_layers(X_sym, X_mask, layer_sizes)
+        (input_variable, params, sz, input_size,
+         hidden_sizes) = self._stack_layers(X_sym, X_mask, layer_sizes)
+
         mu, mu_params = build_linear_layer(
-            sz, self.n_mixture_components * output_size, input_variable,
-            self.random_state)
+            sz, self.n_mixture_components * self.n_features,
+            input_variable, self.random_state)
         params = params + mu_params
+        """
         log_var, log_var_params = build_linear_layer(
             sz, self.n_mixture_components * output_size, input_variable,
             self.random_state)
         params = params + log_var_params
+        """
+        var, var_params = build_linear_layer(
+            sz, self.n_mixture_components * self.n_features,
+            input_variable,
+            self.random_state)
+        params = params + var_params
         coeff, coeff_params = build_linear_layer(
             sz, self.n_mixture_components, input_variable,
             self.random_state)
         params = params + coeff_params
 
         mu_shp = mu.shape
+        var_shp = var.shape
+        """
         log_var_shp = log_var.shape
+        """
         coeff_shp = coeff.shape
         y_shp = y_sym.shape
 
@@ -403,27 +407,36 @@ class GMMRNN(_BaseRNN):
         coeff = T.nnet.softmax(coeff)
         y_r = y_sym.reshape([y_shp[0] * y_shp[1], y_shp[2]])
         mu = mu.reshape([mu_shp[0] * mu_shp[1], mu_shp[2]])
+        """
         log_var = log_var.reshape([log_var_shp[0] * log_var_shp[1],
                                    log_var_shp[2]])
+        """
+        var = var.reshape([var_shp[0] * var_shp[1], var_shp[2]])
 
         # Reshape using 2D shapes...
         y_r = y_r.dimshuffle(0, 1, 'x')
         mu = mu.reshape([mu.shape[0],
                         T.cast(mu.shape[1] / coeff.shape[-1], 'int32'),
                         coeff.shape[-1]])
+        var = var.reshape([var.shape[0],
+                           T.cast(var.shape[1] / coeff.shape[-1], 'int32'),
+                           coeff.shape[-1]])
+        """
         log_var = log_var.reshape([log_var.shape[0],
                                    T.cast(log_var.shape[1] / coeff.shape[-1],
                                           'int32'),
-                                  coeff.shape[-1]])
+                                   coeff.shape[-1]])
+        """
 
         # Calculate GMM cost with minimum sigma tolerance
-        log_var = T.log(T.exp(log_var) + 1E-20)
+        #log_var = T.log(T.exp(log_var) + 0.)
+        log_var = T.log(T.nnet.softplus(var) + 1E-15)
         cost = -0.5 * T.sum(T.sqr(y_r - mu) * T.exp(-log_var) + log_var
-                           + T.log(2 * np.pi), axis=1)
+                            + T.log(2 * np.pi), axis=1)
+
         cost = -logsumexp(T.log(coeff) + cost, axis=1).sum()
         self.params_ = params
         updates = self._updates(X_sym, y_sym, params, cost)
-
 
         self.fit_function = theano.function(inputs=[X_sym, y_sym, X_mask,
                                                     y_mask],
@@ -440,52 +453,40 @@ class GMMRNN(_BaseRNN):
                                                  outputs=[mu, log_var, coeff],
                                                  on_unused_input="ignore")
 
-    def _gen_next_samples(self, X, random_state):
-        X_n, _, X_mask, _ = make_minibatch(X, X, X.shape[1])
-        X_n = X_n.transpose(1, 2, 0)
-        X_mask = np.ones((X_n.shape[0], X_n.shape[1]),
-                         dtype=theano.config.floatX)
-        r = self.generate_function(X_n, X_mask)
-        mu = r[0][0]
-        log_var = r[1][0]
-        coeff = r[2][0]
-        # summed
-        coeff = coeff / coeff.sum()
-        # Choice sample
-        #k = np.where(random_state.rand() < coeff.cumsum())[0][0]
-        #s = random_state.randn(mu.shape[0]) * np.sqrt(
-        #    np.exp(log_var[:, k])) + mu[:, k]
-        # Averaged sample
-        s = random_state.randn(*mu.shape) * np.sqrt(np.exp(log_var)) + mu
-        s = np.dot(s, coeff)
-        return s
-
-    def sample(self, init_seed=None, n_steps=100, random_seed=None):
+    def sample(self, n_steps=100, bias=1., random_seed=None):
         if random_seed is None:
             random_state = self.random_state
         else:
             random_state = np.random.RandomState(random_seed)
         samples = np.zeros((n_steps, self.n_features))
-        if init_seed is None:
-            s = random_state.rand(self.window_size, self.n_features)
-            samples[:self.window_size] = s
-            start = self.window_size
-        else:
-            s = init_seed
-            if len(s) < self.window_size:
-                raise ValueError("init_seed size too small! Must be longer than"
-                                 "window_size %i" % self.window_size)
-            samples[:len(s)] = s
-            start = len(s)
-        for n in range(start, n_steps, self.prediction_size):
-            X_n = rnn_check_array(samples[n - self.window_size:n][None])
-            s = self._gen_next_samples(X_n, random_state)
-            samples[n:n + len(s)] = s.reshape((self.prediction_size,
-                                              self.n_features))
-        # slice back to 2D
+        s = random_state.rand(self.n_features)
+        samples[0] = s
+        for n in range(1, n_steps):
+            X_n = rnn_check_array(samples[None])
+            X_n = X_n.transpose(1, 0, 2)
+            X_mask = np.ones((X_n.shape[0], X_n.shape[1]),
+                                dtype=theano.config.floatX)
+            r = self.generate_function(X_n[:n], X_mask[:n])
+            # get samples
+            # outputs are n_features, n_predictions, n_gaussians
+            mu = r[0][-1]
+            log_var = r[1][-1]
+            coeff = r[2][-1]
+
+            # Make sure it sums to 1
+            coeff = coeff / coeff.sum()
+            # Choice sample
+            #k = np.where(random_state.rand() < coeff.cumsum())[0][0]
+            #s = random_state.randn(mu.shape[0]) * np.sqrt(
+            #    np.exp(log_var[:, k])) + mu[:, k]
+            # Averaged sample
+            s = bias * random_state.randn(*mu.shape) * np.sqrt(np.exp(log_var)) + mu
+            s = np.dot(s, coeff)
+            samples[n] = s
+            # slice back to 2D
         return np.array(samples)
 
-    def force_sample(self, X, random_seed=None):
+    def force_sample(self, X, bias=1., random_seed=None):
         if len(X.shape) != 2:
             raise ValueError("X must be a 2D array of (steps, features)")
         if random_seed is None:
@@ -493,12 +494,28 @@ class GMMRNN(_BaseRNN):
         else:
             random_state = np.random.RandomState(random_seed)
         samples = np.zeros((X.shape[0], self.n_features))
-        samples[:self.window_size] = X[:self.window_size]
-        for n in range(self.window_size, len(X), self.prediction_size):
-            X_n = rnn_check_array(X[n - self.window_size:n][None])
-            s = self._gen_next_samples(X_n, random_state)
-            samples[n:n + len(s)] = s.reshape((self.prediction_size,
-                                              self.n_features))
+        X_n = rnn_check_array(X[None])
+        X_n = X_n.transpose(1, 0, 2)
+        X_mask = np.ones((X_n.shape[0], X_n.shape[1]),
+                         dtype=theano.config.floatX)
+        r = self.generate_function(X_n, X_mask)
+        for n in range(X.shape[0]):
+            # get samples
+            # outputs are n_features, n_predictions, n_gaussians
+            mu = r[0][n]
+            log_var = r[1][n]
+            coeff = r[2][n]
+
+            # Make sure it sums to 1
+            coeff = coeff / coeff.sum()
+            # Choice sample
+            #k = np.where(random_state.rand() < coeff.cumsum())[0][0]
+            #s = random_state.randn(mu.shape[0]) * np.sqrt(
+            #    np.exp(log_var[:, k])) + mu[:, k]
+            # Averaged sample
+            s = bias * random_state.randn(*mu.shape) * np.sqrt(np.exp(log_var)) + mu
+            s = np.dot(s, coeff)
+            samples[n] = s
         return np.array(samples)
 
 
@@ -521,8 +538,8 @@ class EncDecRNN(_BaseRNN):
                 """
 
     def _setup_functions(self, X_sym, y_sym, X_mask, y_mask, layer_sizes):
-        (input_variable, params, sz, input_size, hidden_sizes,
-         output_size) = self._stack_layers(X_sym, X_mask, layer_sizes)
+        (input_variable, params, sz, input_size,
+         hidden_sizes) = self._stack_layers(X_sym, X_mask, layer_sizes)
 
         # hardmode
         context = input_variable

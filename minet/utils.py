@@ -65,25 +65,20 @@ def make_minibatch(X, y, one_hot_size=None, is_one_hot=True):
     return X_n, y_n, X_mask, y_mask
 
 
-def make_regression(X, input_size, prediction_size):
+def make_regression(X):
     X_r = []
     y_r = []
     for s in X:
-        Xi = segment_axis(s[:-prediction_size], length=input_size,
-                          overlap=input_size - prediction_size,
-                          axis=0, end='cut')
-        yi = segment_axis(s[input_size:], length=prediction_size, overlap=0,
-                          axis=0, end='cut')
+        null_padded = np.concatenate((np.zeros((1, s.shape[-1])), s), axis=0)
+        Xi = null_padded[:-1]
+        yi = null_padded[1:]
         X_r.append(Xi)
         y_r.append(yi)
-    X_r = np.concatenate(X_r, axis=0)
-    y_r = np.concatenate(y_r, axis=0)
-    X_n, y_n, _, _ = make_minibatch(X_r, y_r, X_r.shape[-1])
-    X_n = X_n.transpose(1, 2, 0)
-    y_n = y_n.transpose(1, 2, 0)
-    X_mask = np.ones((X_n.shape[0], X_n.shape[1]), dtype=theano.config.floatX)
-    y_mask = np.ones((y_n.shape[0], y_n.shape[1]), dtype=theano.config.floatX)
-    return X_n, y_n, X_mask, y_mask
+    X_r = np.asarray(X_r).astype(theano.config.floatX).transpose(1, 0, 2)
+    y_r = np.asarray(y_r).astype(theano.config.floatX).transpose(1, 0, 2)
+    X_mask = np.ones((X_r.shape[0], X_r.shape[1]), dtype=theano.config.floatX)
+    y_mask = np.ones((y_r.shape[0], y_r.shape[1]), dtype=theano.config.floatX)
+    return X_r, y_r, X_mask, y_mask
 
 def labels_to_chars(labels):
     return "".join([chr(l + 97) for l in labels])

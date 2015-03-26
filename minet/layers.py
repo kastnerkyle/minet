@@ -395,12 +395,12 @@ def build_recurrent_lstm_layer_from_params(params, input_variable, mask,
     # https://github.com/Theano/Theano/issues/1772
     init_hidden = T.zeros((n_samples, hidden_size))
     init_cell = T.zeros((n_samples, hidden_size))
-    init_hidden = T.unbroadcast(init_hidden, 0)
-    init_cell = T.unbroadcast(init_cell, 0)
+    #init_hidden = T.unbroadcast(init_hidden, 0)
+    #init_cell = T.unbroadcast(init_cell, 0)
 
     x = T.dot(input_variable, W) + b
     if one_step:
-        rval = step(x, mask, init_hidden, init_cell)
+        rval = step(x[0], mask[0], init_hidden, init_cell)
     else:
         rval, _ = theano.scan(step,
                               sequences=[x, mask],
