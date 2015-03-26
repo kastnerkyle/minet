@@ -213,13 +213,12 @@ class _BaseRNN(PickleMixin, TrainingMixin):
                 params = forward_params
                 input_variable = forward_hidden
 
-
         if self.bidirectional:
             # Accomodate for concatenated hiddens
             sz = 2 * hidden_sizes[-1]
         else:
             sz = hidden_sizes[-1]
-        return input_variable, params, sz, input_size, hidden_sizes
+        return input_variable, params, sz, input_size, hidden_sizes, output_size
 
     def _updates(self, X_sym, y_sym, params, cost):
         if self.learning_alg == "sgd":
@@ -370,18 +369,13 @@ class GMMRNN(_BaseRNN):
 
     def _setup_functions(self, X_sym, y_sym, X_mask, y_mask, layer_sizes):
         (input_variable, params, sz, input_size,
-         hidden_sizes) = self._stack_layers(X_sym, X_mask, layer_sizes)
+         hidden_sizes, output_size) = self._stack_layers(X_sym, X_mask,
+                                                         layer_sizes)
 
         mu, mu_params = build_linear_layer(
             sz, self.n_mixture_components * self.n_features,
             input_variable, self.random_state)
         params = params + mu_params
-        """
-        log_var, log_var_params = build_linear_layer(
-            sz, self.n_mixture_components * output_size, input_variable,
-            self.random_state)
-        params = params + log_var_params
-        """
         var, var_params = build_linear_layer(
             sz, self.n_mixture_components * self.n_features,
             input_variable,
@@ -394,9 +388,6 @@ class GMMRNN(_BaseRNN):
 
         mu_shp = mu.shape
         var_shp = var.shape
-        """
-        log_var_shp = log_var.shape
-        """
         coeff_shp = coeff.shape
         y_shp = y_sym.shape
 
@@ -407,10 +398,6 @@ class GMMRNN(_BaseRNN):
         coeff = T.nnet.softmax(coeff)
         y_r = y_sym.reshape([y_shp[0] * y_shp[1], y_shp[2]])
         mu = mu.reshape([mu_shp[0] * mu_shp[1], mu_shp[2]])
-        """
-        log_var = log_var.reshape([log_var_shp[0] * log_var_shp[1],
-                                   log_var_shp[2]])
-        """
         var = var.reshape([var_shp[0] * var_shp[1], var_shp[2]])
 
         # Reshape using 2D shapes...
@@ -421,15 +408,8 @@ class GMMRNN(_BaseRNN):
         var = var.reshape([var.shape[0],
                            T.cast(var.shape[1] / coeff.shape[-1], 'int32'),
                            coeff.shape[-1]])
-        """
-        log_var = log_var.reshape([log_var.shape[0],
-                                   T.cast(log_var.shape[1] / coeff.shape[-1],
-                                          'int32'),
-                                   coeff.shape[-1]])
-        """
 
-        # Calculate GMM cost with minimum sigma tolerance
-        #log_var = T.log(T.exp(log_var) + 0.)
+        # Calculate GMM cost with minimum tolerance
         log_var = T.log(T.nnet.softplus(var) + 1E-15)
         cost = -0.5 * T.sum(T.sqr(y_r - mu) * T.exp(-log_var) + log_var
                             + T.log(2 * np.pi), axis=1)
@@ -453,7 +433,7 @@ class GMMRNN(_BaseRNN):
                                                  outputs=[mu, log_var, coeff],
                                                  on_unused_input="ignore")
 
-    def sample(self, n_steps=100, bias=1., random_seed=None):
+    def sample(self, n_steps=100, bias=1., alg="soft", random_seed=None):
         if random_seed is None:
             random_state = self.random_state
         else:
@@ -465,7 +445,7 @@ class GMMRNN(_BaseRNN):
             X_n = rnn_check_array(samples[None])
             X_n = X_n.transpose(1, 0, 2)
             X_mask = np.ones((X_n.shape[0], X_n.shape[1]),
-                                dtype=theano.config.floatX)
+                             dtype=theano.config.floatX)
             r = self.generate_function(X_n[:n], X_mask[:n])
             # get samples
             # outputs are n_features, n_predictions, n_gaussians
@@ -475,18 +455,22 @@ class GMMRNN(_BaseRNN):
 
             # Make sure it sums to 1
             coeff = coeff / coeff.sum()
-            # Choice sample
-            #k = np.where(random_state.rand() < coeff.cumsum())[0][0]
-            #s = random_state.randn(mu.shape[0]) * np.sqrt(
-            #    np.exp(log_var[:, k])) + mu[:, k]
-            # Averaged sample
-            s = bias * random_state.randn(*mu.shape) * np.sqrt(np.exp(log_var)) + mu
-            s = np.dot(s, coeff)
+            if alg == "hard":
+                # Choice sample
+                k = np.where(random_state.rand() < coeff.cumsum())[0][0]
+                s = random_state.randn(mu.shape[0]) * np.sqrt(
+                    np.exp(log_var[:, k])) + mu[:, k]
+            elif alg == "soft":
+                # Averaged sample
+                s = bias * random_state.randn(*mu.shape) * np.sqrt(
+                    np.exp(log_var)) + mu
+                s = np.dot(s, coeff)
+            else:
+                raise ValueError("alg must be 'hard' or 'soft'")
             samples[n] = s
-            # slice back to 2D
         return np.array(samples)
 
-    def force_sample(self, X, bias=1., random_seed=None):
+    def force_sample(self, X, bias=1., alg="soft", random_seed=None):
         if len(X.shape) != 2:
             raise ValueError("X must be a 2D array of (steps, features)")
         if random_seed is None:
@@ -508,13 +492,18 @@ class GMMRNN(_BaseRNN):
 
             # Make sure it sums to 1
             coeff = coeff / coeff.sum()
-            # Choice sample
-            #k = np.where(random_state.rand() < coeff.cumsum())[0][0]
-            #s = random_state.randn(mu.shape[0]) * np.sqrt(
-            #    np.exp(log_var[:, k])) + mu[:, k]
-            # Averaged sample
-            s = bias * random_state.randn(*mu.shape) * np.sqrt(np.exp(log_var)) + mu
-            s = np.dot(s, coeff)
+            if alg == "hard":
+                # Choice sample
+                k = np.where(random_state.rand() < coeff.cumsum())[0][0]
+                s = random_state.randn(mu.shape[0]) * np.sqrt(
+                    np.exp(log_var[:, k])) + mu[:, k]
+            elif alg == "soft":
+                # Averaged sample
+                s = bias * random_state.randn(*mu.shape) * np.sqrt(
+                    np.exp(log_var)) + mu
+                s = np.dot(s, coeff)
+            else:
+                raise ValueError("alg must be 'hard' or 'soft'")
             samples[n] = s
         return np.array(samples)
 
@@ -539,7 +528,8 @@ class EncDecRNN(_BaseRNN):
 
     def _setup_functions(self, X_sym, y_sym, X_mask, y_mask, layer_sizes):
         (input_variable, params, sz, input_size,
-         hidden_sizes) = self._stack_layers(X_sym, X_mask, layer_sizes)
+         hidden_sizes, output_size) = self._stack_layers(X_sym, X_mask,
+                                                         layer_sizes)
 
         # hardmode
         context = input_variable
