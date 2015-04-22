@@ -7,7 +7,8 @@ except ImportError:
 import numpy as np
 import theano
 import theano.tensor as T
-from utils import PickleMixin, TrainingMixin, minibatch_indices, make_minibatch
+from utils import PickleMixin, minibatch_indices, make_minibatch
+from optimizers import rmsprop, sgd_nesterov
 from utils import make_regression
 from extmath import logsumexp
 from layers import concatenate, build_recurrent_lstm_layer, build_linear_layer
@@ -53,7 +54,7 @@ def rnn_check_array(X, y=None):
         return X
 
 
-class _BaseRNN(PickleMixin, TrainingMixin):
+class _BaseRNN(PickleMixin):
     def __init__(self, hidden_layer_sizes=[100], max_iter=1E2,
                  learning_rate=0.01, momentum=0., learning_alg="sgd",
                  recurrent_activation="lstm", minibatch_size=1,
@@ -220,18 +221,6 @@ class _BaseRNN(PickleMixin, TrainingMixin):
             sz = hidden_sizes[-1]
         return input_variable, params, sz, input_size, hidden_sizes, output_size
 
-    def _updates(self, X_sym, y_sym, params, cost):
-        if self.learning_alg == "sgd":
-            updates = self.get_clip_sgd_updates(
-                params, cost, self.learning_rate, self.momentum)
-        elif self.learning_alg == "rmsprop":
-            updates = self.get_clip_rmsprop_updates(
-                params, cost, self.learning_rate, self.momentum)
-        else:
-            raise ValueError("Value of %s not a valid learning_alg!"
-                             % self.learning_alg)
-        return updates
-
 
 class RNN(_BaseRNN):
     def _setup_functions(self, X_sym, y_sym, X_mask, y_mask, layer_sizes):
@@ -279,6 +268,15 @@ class GMMRNN(_BaseRNN):
             self.random_state = np.random.RandomState(random_seed)
         self.learning_rate = learning_rate
         self.learning_alg = learning_alg
+        if self.learning_alg == "rmsprop":
+            self.optimizer = rmsprop
+        elif self.learning_alg == "sgd":
+            self.optimizer = sgd_nesterov
+        else:
+            raise ValueError("Value of self.learning_alg"
+                             "not understood! Valid options"
+                             "%s, got %s" % (["sgd", "rmsprop"],
+                                             self.learning_alg))
         self.momentum = momentum
         self.bidirectional = bidirectional
         self.hidden_layer_sizes = hidden_layer_sizes
@@ -415,8 +413,12 @@ class GMMRNN(_BaseRNN):
                             + T.log(2 * np.pi), axis=1)
 
         cost = -logsumexp(T.log(coeff) + cost, axis=1).sum()
+        grads = T.grad(cost, params)
         self.params_ = params
-        updates = self._updates(X_sym, y_sym, params, cost)
+        self.grads_ = grads
+        self.opt_ = self.optimizer(params)
+        updates = self.opt_.updates(
+            params, grads, self.learning_rate, self.momentum)
 
         self.fit_function = theano.function(inputs=[X_sym, y_sym, X_mask,
                                                     y_mask],

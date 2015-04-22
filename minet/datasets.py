@@ -1,184 +1,270 @@
 # -*- coding: utf 8 -*-
 from __future__ import division
-try:
-    import cPickle
-except ImportError:
-    import pickle as cPickle
-import gzip
 import tarfile
 import os
 from scipy.io import wavfile
 import numpy as np
 import tables
 import numbers
-import glob
 import random
 import string
 import fnmatch
 import theano
-from matplotlib.pyplot import specgram
+from lxml import etree
+try:
+    import urllib.request as urllib  # for backwards compatibility
+except ImportError:
+    import urllib2 as urllib
 
-def load_mnist():
-    # Check if dataset is in the data directory.
-    data_path = os.path.join(os.path.split(__file__)[0], "data")
-    if not os.path.exists(data_path):
-        os.makedirs(data_path)
 
-    dataset = 'mnist.pkl.gz'
-    data_file = os.path.join(data_path, dataset)
-    if os.path.isfile(data_file):
-        dataset = data_file
+def get_dataset_dir(dataset_name, data_dir=None, folder=None, create_dir=True):
+    if not data_dir:
+        data_dir = os.getenv("MINET_DATA", os.path.join(
+            os.path.expanduser("~"), "minet_data"))
+    if folder is None:
+        data_dir = os.path.join(data_dir, dataset_name)
+    else:
+        data_dir = os.path.join(data_dir, folder)
+    if not os.path.exists(data_dir) and create_dir:
+        os.makedirs(data_dir)
+    return data_dir
 
-    if (not os.path.isfile(data_file)):
+
+def download(url, server_fname, local_fname=None, progress_update_percentage=5):
+    """
+    An internet download utility modified from
+    http://stackoverflow.com/questions/22676/
+    how-do-i-download-a-file-over-http-using-python/22776#22776
+    """
+    u = urllib.urlopen(url)
+    if local_fname is None:
+        local_fname = server_fname
+    full_path = local_fname
+    meta = u.info()
+    with open(full_path, 'wb') as f:
         try:
-            import urllib
-            urllib.urlretrieve('http://google.com')
-        except AttributeError:
-            import urllib.request as urllib
-        url = 'http://www.iro.umontreal.ca/~lisa/deep/data/mnist/mnist.pkl.gz'
-        print('Downloading data from %s' % url)
-        urllib.urlretrieve(url, data_file)
-
-    print('... loading data')
-    # Load the dataset
-    f = gzip.open(data_file, 'rb')
-    try:
-        train_set, valid_set, test_set = cPickle.load(f, encoding="latin1")
-    except TypeError:
-        train_set, valid_set, test_set = cPickle.load(f)
-    f.close()
-
-    test_x, test_y = test_set
-    test_x = test_x.astype('float32')
-    test_y = test_y.astype('int32')
-    valid_x, valid_y = valid_set
-    valid_x = valid_x.astype('float32')
-    valid_y = valid_y.astype('int32')
-    train_x, train_y = train_set
-    train_x = train_x.astype('float32')
-    train_y = train_y.astype('int32')
-
-    rval = [(train_x, train_y), (valid_x, valid_y), (test_x, test_y)]
-    return rval
+            file_size = int(meta.get("Content-Length"))
+        except TypeError:
+            print("WARNING: Cannot get file size, displaying bytes instead!")
+            file_size = 100
+        print("Downloading: %s Bytes: %s" % (server_fname, file_size))
+        file_size_dl = 0
+        block_sz = int(1E7)
+        p = 0
+        while True:
+            buffer = u.read(block_sz)
+            if not buffer:
+                break
+            file_size_dl += len(buffer)
+            f.write(buffer)
+            if (file_size_dl * 100. / file_size) > p:
+                status = r"%10d  [%3.2f%%]" % (file_size_dl, file_size_dl *
+                                               100. / file_size)
+                print(status)
+                p += progress_update_percentage
 
 
-def load_cifar10():
-    # Check if dataset is in the data directory.
-    data_path = os.path.join(os.path.split(__file__)[0], "data")
-    if not os.path.exists(data_path):
-        os.makedirs(data_path)
-
-    dataset = 'cifar-10-python.tar.gz'
-    data_file = os.path.join(data_path, dataset)
-    if os.path.isfile(data_file):
-        dataset = data_file
-
-    if (not os.path.isfile(data_file)):
-        try:
-            import urllib
-            urllib.urlretrieve('http://google.com')
-        except AttributeError:
-            import urllib.request as urllib
-        url = 'http://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz'
-        print('Downloading data from %s' % url)
-        urllib.urlretrieve(url, data_file)
-
-    print('... loading data')
-    tar = tarfile.open(data_file)
-    os.chdir(data_path)
-    tar.extractall()
-    tar.close()
-
-    data_path = os.path.join(data_path, "cifar-10-batches-py")
-    batch_files = glob.glob(os.path.join(data_path, "*batch*"))
-    train_data = []
-    train_labels = []
-    test_data = []
-    test_labels = []
-    for f in batch_files:
-        batch_file = open(f, 'rb')
-        d = cPickle.load(batch_file)
-        batch_file.close()
-        fname = f.split(os.path.sep)[-1]
-        if "data" in fname:
-            data = d['data']
-            labels = d['labels']
-            train_data.append(data)
-            train_labels.append(labels)
-        elif "test" in fname:
-            data = d['data']
-            labels = d['labels']
-            test_data.append(data)
-            test_labels.append(labels)
-
-    # Split into 40000 train 10000 valid 10000 test
-    train_x = np.asarray(train_data)
-    train_y = np.asarray(train_labels)
-    test_x = np.asarray(test_data)
-    test_y = np.asarray(test_labels)
-    valid_x = train_x[-10000:]
-    valid_y = train_y[-10000:]
-    train_x = train_x[:-10000]
-    train_y = train_y[:-10000]
-
-    test_x = test_x.astype('float32')
-    test_y = test_y.astype('int32')
-    valid_x = valid_x.astype('float32')
-    valid_y = valid_y.astype('int32')
-    train_x = train_x.astype('float32')
-    train_y = train_y.astype('int32')
-
-    rval = [(train_x, train_y), (valid_x, valid_y), (test_x, test_y)]
-    return rval
+def check_fetch_iamondb():
+    partial_path = get_dataset_dir("iamondb")
+    if not os.path.exists(partial_path):
+        os.makedirs(partial_path)
+    strokes_path = os.path.join(partial_path, "lineStrokes")
+    ascii_path = os.path.join(partial_path, "ascii")
+    if not os.path.exists(strokes_path) or not os.path.exists(ascii_path):
+        raise ValueError("You must download the data from IAMOnDB, and"
+                         "unpack in %s" % partial_path)
+    return strokes_path, ascii_path
 
 
-def load_scribe():
-    # Check if dataset is in the data directory.
-    data_path = os.path.join(os.path.split(__file__)[0], "data")
-    if not os.path.exists(data_path):
-        os.makedirs(data_path)
+def plot_scatter_iamondb_example(X, y=None):
+    import matplotlib.pyplot as plt
+    rgba_colors = np.zeros((len(X), 4))
+    # for red the first column needs to be one
+    rgba_colors[:, 0] = X[:, 0]
+    # for blue last color column needs to be one
+    rgba_colors[:, 2] = np.abs(1 - X[:, 0])
+    # the fourth column needs to be your alphas
+    rgba_colors[:, 3] = np.ones((len(X),)) * .4 + .4 * X[:, 0]
+    plt.scatter(X[:, 1], X[:, 2], color=rgba_colors)
+    if y is not None:
+        plt.title(y)
+    plt.axis('equal')
+    plt.show()
 
-    dataset = 'scribe.pkl'
-    data_file = os.path.join(data_path, dataset)
-    if os.path.isfile(data_file):
-        dataset = data_file
 
-    if (not os.path.isfile(data_file)):
-        try:
-            import urllib
-            urllib.urlretrieve('http://google.com')
-            url = 'https://dl.dropboxusercontent.com/u/15378192/scribe2.pkl'
-        except AttributeError:
-            import urllib.request as urllib
-            url = 'https://dl.dropboxusercontent.com/u/15378192/scribe3.pkl'
-        print('Downloading data from %s' % url)
-        urllib.urlretrieve(url, data_file)
-
-    print('... loading data')
-    with open(data_file, 'rb') as pkl_file:
-        data = cPickle.load(pkl_file)
-
-    data_x, data_y = [], []
-    for x, y in zip(data['x'], data['y']):
-        data_y.append(np.asarray(y, dtype=np.int32))
-        data_x.append(np.asarray(x, dtype=theano.config.floatX).T)
-
-    train_x = data_x[:750]
-    train_y = data_y[:750]
-    valid_x = data_x[750:900]
-    valid_y = data_y[750:900]
-    test_x = data_x[900:]
-    test_y = data_y[900:]
-    rval = [(train_x, train_y), (valid_x, valid_y), (test_x, test_y)]
-    return rval
+def plot_lines_iamondb_example(X, y=None):
+    import matplotlib.pyplot as plt
+    val_index = np.where(X[:, 0] != 1)[0]
+    contiguous = np.where((val_index[1:] - val_index[:-1]) == 1)[0] + 1
+    non_contiguous = np.where((val_index[1:] - val_index[:-1]) != 1)[0] + 1
+    prev_nc = 0
+    for nc in val_index[non_contiguous]:
+        ind = ((prev_nc <= contiguous) & (contiguous < nc))[:-1]
+        prev_nc = nc
+        plt.plot(X[val_index[ind], 1], X[val_index[ind], 2])
+    plt.plot(X[prev_nc:, 1], X[prev_nc:, 2])
+    if y is not None:
+        plt.title(y)
+    plt.axis('equal')
+    plt.show()
 
 
 # A tricky trick for monkeypatching an instancemethod that is
 # CPython :( there must be a better way
-class _cVLArray(tables.VLArray):
+class _textEArray(tables.EArray):
     pass
 
+def fetch_iamondb():
+    strokes_path, ascii_path = check_fetch_iamondb()
 
+    stroke_matches = []
+    for root, dirnames, filenames in os.walk(strokes_path):
+        for filename in fnmatch.filter(filenames, '*.xml'):
+            stroke_matches.append(os.path.join(root, filename))
+
+    ascii_matches = []
+    for root, dirnames, filenames in os.walk(ascii_path):
+        for filename in fnmatch.filter(filenames, '*.txt'):
+            ascii_matches.append(os.path.join(root, filename))
+
+    partial_path = get_dataset_dir("iamondb")
+    hdf5_path = os.path.join(partial_path, "iamondb.h5")
+    if not os.path.exists(hdf5_path):
+        # setup tables
+        compression_filter = tables.Filters(complevel=5, complib='blosc')
+        hdf5_file = tables.openFile(hdf5_path, mode='w')
+        handwriting = hdf5_file.createEArray(hdf5_file.root, 'handwriting',
+                                             tables.Int32Atom(),
+                                             shape=(0, 3),
+                                             filters=compression_filter,
+                                             expectedrows=len(ascii_matches))
+        handwriting_poslen = hdf5_file.createEArray(hdf5_file.root,
+                                                    'handwriting_poslen',
+                                                    tables.Int32Atom(),
+                                                    shape=(0, 2),
+                                                    filters=compression_filter,
+                                                    expectedrows=len(
+                                                        ascii_matches))
+        text = hdf5_file.createEArray(hdf5_file.root, 'text',
+                                      tables.Int32Atom(),
+                                      shape=(0, 1),
+                                      filters=compression_filter,
+                                      expectedrows=len(ascii_matches))
+        text_poslen = hdf5_file.createEArray(hdf5_file.root, 'text_poslen',
+                                             tables.Int32Atom(),
+                                             shape=(0, 2),
+                                             filters=compression_filter,
+                                             expectedrows=len(ascii_matches))
+
+        current_text_pos = 0
+        current_handwriting_pos = 0
+        for na, ascii_file in enumerate(ascii_matches):
+            if na % 100 == 0:
+                print("Reading ascii file %i of %i" % (na, len(ascii_matches)))
+            with open(ascii_file) as fp:
+                cleaned = [t.strip() for t in fp.readlines()
+                        if 'OCR' not in t
+                        and 'CSR' not in t
+                        and t != '\r\n'
+                        and t != '\n']
+
+                # Find correspnding XML file for ascii file
+                file_id = ascii_file.split(os.sep)[-2]
+                submatches = [sf for sf in stroke_matches if file_id in sf]
+                submatches = sorted(submatches,
+                                    key=lambda x: int(
+                                        x.split(os.sep)[-1].split("-")[-1][:-4]))
+                # Skip weird files?
+                if len(cleaned) != len(submatches):
+                    continue
+
+                for n, stroke_file in enumerate(submatches):
+                    with open(stroke_file) as fp:
+                        tree = etree.parse(fp)
+                        root = tree.getroot()
+                        # Get all the values from the XML
+                        # 0th index is up/down
+                        s = np.array([[i,
+                            int(Point.attrib['x']),
+                            int(Point.attrib['y'])]
+                            for StrokeSet in root
+                            for i, Stroke in enumerate(StrokeSet)
+                            for Point in Stroke])
+                        # flip y axis
+                        s[:, 2] = -s[:, 2]
+                        # Get end of stroke points
+                        c = s[1:, 0] != s[:-1, 0]
+                        ci = np.where(c == True)[0]
+                        nci = np.where(c == False)[0]
+                        # pen down everywhere else
+                        s[0, 0] = 0
+                        s[nci, 0] = 0
+                        # set pen up
+                        s[ci, 0] = 1
+                        s[-1, 0] = 1
+
+                        lh = len(s)
+                        for i in range(lh):
+                            handwriting.append(s[i][None])
+                        handwriting_poslen.append(
+                            np.array([current_handwriting_pos, lh])[None])
+                        current_handwriting_pos += lh
+
+                        lt = len(cleaned[n])
+                        for i in range(lt):
+                            text.append(
+                                np.array(ord(cleaned[n][i]))[None, None])
+                        text_poslen.append(
+                            np.array([current_text_pos, lt])[None])
+                        current_text_pos += lt
+        hdf5_file.close()
+    hdf5_file = tables.openFile(hdf5_path, mode='r')
+    handwriting = hdf5_file.root.handwriting
+    handwriting_poslen = hdf5_file.root.handwriting_poslen
+    text = hdf5_file.root.text
+    text_poslen = hdf5_file.root.text_poslen
+
+    # A dirty hack to only monkeypatch text
+    text.__class__ = _textEArray
+
+    # override getter so that it gets reshaped to 2D when fetched
+    old_getter = text.__getitem__
+
+    def getter(self, key):
+        if isinstance(key, numbers.Integral) or isinstance(key, np.integer):
+            p, l = text_poslen[key]
+            return "".join(map(chr, self.read(p, p+l, 1)))
+        elif isinstance(key, slice):
+            start, stop, step = self._processRange(key.start, key.stop,
+                                                   key.step)
+            if key.stop is None:
+                stop = len(text_poslen)
+            if key.start is None:
+                start = 0
+
+            if stop <= start:
+                # replicate slice where stop <= start
+                return []
+
+            if stop >= len(text_poslen):
+                stop = len(text_poslen)
+            elif key.stop < 0 and key.stop is not None:
+                stop = len(text_poslen) + key.stop
+            if key.start < 0 and key.start is not None:
+                start = len(text_poslen) + key.start
+
+            return ["".join(map(chr, self.read(text_poslen[k][0],
+                                               sum(text_poslen[k]), 1)))
+                    for k in range(start, stop, step)]
+
+    # Patch __getitem__ in custom subclass, applying to all instances of it
+    _textEArray.__getitem__ = getter
+
+    from IPython import embed; embed()
+    #plot_iamondb_example(all_X[0], all_y[0])
+
+
+"""
 def load_fruitspeech():
     # Check if dataset is in the data directory.
     data_path = os.path.join(os.path.split(__file__)[0], "data")
@@ -538,3 +624,4 @@ def load_librispeech():
     test_y = data_y[2500:]
     rval = [(train_x, train_y), (valid_x, valid_y), (test_x, test_y)]
     return rval
+"""
