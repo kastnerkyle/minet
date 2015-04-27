@@ -79,17 +79,20 @@ def check_fetch_iamondb():
 def plot_scatter_iamondb_example(X, y=None):
     import matplotlib.pyplot as plt
     rgba_colors = np.zeros((len(X), 4))
+    normed = (X - X.min(axis=0)) / (X.max(axis=0) - X.min(axis=0))
     # for red the first column needs to be one
-    rgba_colors[:, 0] = X[:, 0]
+    rgba_colors[:, 0] = normed[:, 0]
     # for blue last color column needs to be one
-    rgba_colors[:, 2] = np.abs(1 - X[:, 0])
-    # the fourth column needs to be your alphas
-    rgba_colors[:, 3] = np.ones((len(X),)) * .4 + .4 * X[:, 0]
-    plt.scatter(X[:, 1], X[:, 2], color=rgba_colors)
+    rgba_colors[:, 2] = np.abs(1 - normed[:, 0])
+    # the fourth column needs to be alphas
+    rgba_colors[:, 3] = np.ones((len(X),)) * .4 + .4 * normed[:, 0]
+    if len(X[0]) == 3:
+        plt.scatter(X[:, 1], X[:, 2], color=rgba_colors)
+    elif len(X[0]) == 2:
+        plt.scatter(X[:, 0], X[:, 1], color=rgba_colors)
     if y is not None:
         plt.title(y)
     plt.axis('equal')
-    plt.show()
 
 
 def plot_lines_iamondb_example(X, y=None):
@@ -106,13 +109,16 @@ def plot_lines_iamondb_example(X, y=None):
     if y is not None:
         plt.title(y)
     plt.axis('equal')
-    plt.show()
 
-
-# A tricky trick for monkeypatching an instancemethod that is
-# CPython :( there must be a better way
+# A trick for monkeypatching an instancemethod that when method is a
+# c-extension? there must be a better way
 class _textEArray(tables.EArray):
     pass
+
+
+class _handwritingEArray(tables.EArray):
+    pass
+
 
 def fetch_iamondb():
     strokes_path, ascii_path = check_fetch_iamondb()
@@ -163,18 +169,21 @@ def fetch_iamondb():
                 print("Reading ascii file %i of %i" % (na, len(ascii_matches)))
             with open(ascii_file) as fp:
                 cleaned = [t.strip() for t in fp.readlines()
-                        if 'OCR' not in t
-                        and 'CSR' not in t
-                        and t != '\r\n'
-                        and t != '\n']
+                           if 'OCR' not in t
+                           and 'CSR' not in t
+                           and t != '\r\n'
+                           and t != '\n']
 
                 # Find correspnding XML file for ascii file
                 file_id = ascii_file.split(os.sep)[-2]
                 submatches = [sf for sf in stroke_matches if file_id in sf]
+                # Sort by file number
                 submatches = sorted(submatches,
                                     key=lambda x: int(
-                                        x.split(os.sep)[-1].split("-")[-1][:-4]))
-                # Skip weird files?
+                                        x.split(os.sep)[-1].split(
+                                            "-")[-1][:-4]))
+                # Skip files where ascii length and number of XML don't match
+                # TODO: Figure out why this is happening
                 if len(cleaned) != len(submatches):
                     continue
 
@@ -183,20 +192,19 @@ def fetch_iamondb():
                         tree = etree.parse(fp)
                         root = tree.getroot()
                         # Get all the values from the XML
-                        # 0th index is up/down
-                        s = np.array([[i,
-                            int(Point.attrib['x']),
-                            int(Point.attrib['y'])]
-                            for StrokeSet in root
-                            for i, Stroke in enumerate(StrokeSet)
-                            for Point in Stroke])
+                        # 0th index is stroke ID, will become up/down
+                        s = np.array([[i, int(Point.attrib['x']),
+                                       int(Point.attrib['y'])]
+                                       for StrokeSet in root
+                                       for i, Stroke in enumerate(StrokeSet)
+                                       for Point in Stroke])
                         # flip y axis
                         s[:, 2] = -s[:, 2]
                         # Get end of stroke points
                         c = s[1:, 0] != s[:-1, 0]
                         ci = np.where(c == True)[0]
                         nci = np.where(c == False)[0]
-                        # pen down everywhere else
+                        # set pen down
                         s[0, 0] = 0
                         s[nci, 0] = 0
                         # set pen up
@@ -224,13 +232,11 @@ def fetch_iamondb():
     text = hdf5_file.root.text
     text_poslen = hdf5_file.root.text_poslen
 
+    # Monkeypatch text
     # A dirty hack to only monkeypatch text
     text.__class__ = _textEArray
 
-    # override getter so that it gets reshaped to 2D when fetched
-    old_getter = text.__getitem__
-
-    def getter(self, key):
+    def text_getter(self, key):
         if isinstance(key, numbers.Integral) or isinstance(key, np.integer):
             p, l = text_poslen[key]
             return "".join(map(chr, self.read(p, p+l, 1)))
@@ -258,10 +264,44 @@ def fetch_iamondb():
                     for k in range(start, stop, step)]
 
     # Patch __getitem__ in custom subclass, applying to all instances of it
-    _textEArray.__getitem__ = getter
+    _textEArray.__getitem__ = text_getter
 
-    from IPython import embed; embed()
-    #plot_iamondb_example(all_X[0], all_y[0])
+    # Monkeypatch handwriting
+    # A dirty hack to only monkeypatch handwriting
+    handwriting.__class__ = _handwritingEArray
+
+    def handwriting_getter(self, key):
+        if isinstance(key, numbers.Integral) or isinstance(key, np.integer):
+            p, l = handwriting_poslen[key]
+            return self.read(p, p+l, 1)
+        elif isinstance(key, slice):
+            start, stop, step = self._processRange(key.start, key.stop,
+                                                   key.step)
+            if key.stop is None:
+                stop = len(text_poslen)
+            if key.start is None:
+                start = 0
+
+            if stop <= start:
+                # replicate slice where stop <= start
+                return []
+
+            if stop >= len(text_poslen):
+                stop = len(text_poslen)
+            elif key.stop < 0 and key.stop is not None:
+                stop = len(text_poslen) + key.stop
+            if key.start < 0 and key.start is not None:
+                start = len(text_poslen) + key.start
+
+            return [self.read(handwriting_poslen[k][0],
+                              sum(handwriting_poslen[k]), 1)
+                    for k in range(start, stop, step)]
+
+    # Patch __getitem__ in custom subclass, applying to all instances of it
+    _handwritingEArray.__getitem__ = handwriting_getter
+    X = handwriting
+    y = text
+    return (X, y)
 
 
 """
