@@ -92,7 +92,6 @@ def plot_scatter_iamondb_example(X, y=None):
         plt.scatter(X[:, 0], X[:, 1], color=rgba_colors)
     if y is not None:
         plt.title(y)
-    plt.axis('equal')
 
 
 def plot_lines_iamondb_example(X, y=None):
@@ -108,7 +107,7 @@ def plot_lines_iamondb_example(X, y=None):
     plt.plot(X[prev_nc:, 1], X[prev_nc:, 2])
     if y is not None:
         plt.title(y)
-    plt.axis('equal')
+
 
 # A trick for monkeypatching an instancemethod that when method is a
 # c-extension? there must be a better way
@@ -273,7 +272,7 @@ def fetch_iamondb():
     def handwriting_getter(self, key):
         if isinstance(key, numbers.Integral) or isinstance(key, np.integer):
             p, l = handwriting_poslen[key]
-            return self.read(p, p+l, 1)
+            return self.read(p, p+l, 1).astype('float32')
         elif isinstance(key, slice):
             start, stop, step = self._processRange(key.start, key.stop,
                                                    key.step)
@@ -294,7 +293,7 @@ def fetch_iamondb():
                 start = len(text_poslen) + key.start
 
             return [self.read(handwriting_poslen[k][0],
-                              sum(handwriting_poslen[k]), 1)
+                              sum(handwriting_poslen[k]), 1).astype('float32')
                     for k in range(start, stop, step)]
 
     # Patch __getitem__ in custom subclass, applying to all instances of it

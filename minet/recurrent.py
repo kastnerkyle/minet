@@ -335,6 +335,8 @@ class GMMRNN(_BaseRNN):
                     X_mask_sym.tag.test_value = X_mask
                     y_mask_sym.tag.test_value = y_mask
                     print("Building model!")
+                    print("Minibatch X size %s" % str(X_n.shape))
+                    print("Minibatch y size %s" % str(y_n.shape))
                     self._setup_functions(X_sym, y_sym, X_mask_sym, y_mask_sym,
                                           self.layer_sizes_)
                 train_loss = self.fit_function(X_n, y_n, X_mask, y_mask)
