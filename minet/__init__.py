@@ -4,6 +4,8 @@ __version__ = '.'.join(__version_info__)
 from .recurrent import RNN
 from .recurrent import EncDecRNN
 from .recurrent import GMMRNN
+from .recurrent import AGMMRNN
 __all__ = ['RNN',
            'EncDecRNN',
-           'GMMRNN']
+           'GMMRNN',
+           'AGMMRNN']

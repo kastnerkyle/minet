@@ -6,18 +6,18 @@ import matplotlib.pyplot as plt
 
 n_h = 50
 time_steps = 100
-# n_y is equal to the number of classes
 random_state = np.random.RandomState(1999)
 
-sin = np.sin(np.linspace(-3 * np.pi, 3 * np.pi, time_steps))
-seq = sin[None, :, None]
+sin = np.sin(np.linspace(-3 * np.pi, 3 * np.pi, time_steps))[:, None]
+cos = np.cos(np.linspace(-3 * np.pi, 3 * np.pi, time_steps))[:, None]
+seq = np.concatenate((sin, cos), axis=-1)[None]
 
 clf = GMMRNN(learning_alg="rmsprop", n_mixture_components=20,
              hidden_layer_sizes=[n_h],
              max_iter=1000, learning_rate=.0001,
              bidirectional=False, momentum=0.99,
              recurrent_activation="lstm", minibatch_size=10,
-             save_frequency=500, random_seed=1999)
+             save_frequency=1000, random_seed=1999)
 
 shp = seq.shape
 seq_r = seq.reshape(shp[0] * shp[1], shp[-1])

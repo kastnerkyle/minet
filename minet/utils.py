@@ -80,6 +80,7 @@ def make_regression(X):
     y_mask = np.ones((y_r.shape[0], y_r.shape[1]), dtype=theano.config.floatX)
     return X_r, y_r, X_mask, y_mask
 
+
 def labels_to_chars(labels):
     return "".join([chr(l + 97) for l in labels])
 

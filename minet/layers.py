@@ -320,8 +320,7 @@ def build_recurrent_conditional_lstm_layer_from_params(params, input_variable,
     return rval[:4], params
 
 
-def init_recurrent_lstm_layer(input_size, hidden_size, output_size,
-                              random_state):
+def init_recurrent_lstm_layer(input_size, hidden_size, random_state):
     # input to LSTM
     W_ = np.concatenate(
         [np_rand((input_size, hidden_size), random_state),
@@ -349,11 +348,9 @@ def init_recurrent_lstm_layer(input_size, hidden_size, output_size,
     return params
 
 
-def build_recurrent_lstm_layer(input_size, hidden_size, output_size,
-                               input_variable, mask,
+def build_recurrent_lstm_layer(input_size, hidden_size, input_variable, mask,
                                random_state, one_step=False):
-    params = init_recurrent_lstm_layer(input_size, hidden_size, output_size,
-                                       random_state)
+    params = init_recurrent_lstm_layer(input_size, hidden_size, random_state)
     return build_recurrent_lstm_layer_from_params(params, input_variable, mask,
                                                   random_state,
                                                   one_step=one_step)
@@ -395,8 +392,8 @@ def build_recurrent_lstm_layer_from_params(params, input_variable, mask,
     # https://github.com/Theano/Theano/issues/1772
     init_hidden = T.zeros((n_samples, hidden_size))
     init_cell = T.zeros((n_samples, hidden_size))
-    #init_hidden = T.unbroadcast(init_hidden, 0)
-    #init_cell = T.unbroadcast(init_cell, 0)
+    init_hidden = T.unbroadcast(init_hidden, 0)
+    init_cell = T.unbroadcast(init_cell, 0)
 
     x = T.dot(input_variable, W) + b
     if one_step:
