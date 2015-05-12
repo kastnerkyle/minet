@@ -11,7 +11,7 @@ X, y = fetch_iamondb()
 clf = AGMMRNN(learning_alg="rmsprop", n_mixture_components=5,
               hidden_layer_sizes=[500],
               max_iter=25000, learning_rate=.00001,
-              bidirectional=False, momentum=0.99,
+              bidirectional=False, momentum=0.8,
               recurrent_activation="lstm", minibatch_size=1000,
               save_frequency=100, random_seed=1999)
 

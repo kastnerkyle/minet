@@ -18,6 +18,8 @@ model_path = sys.argv[1]
 f = open(model_path, mode='rb')
 clf = cPickle.load(f)
 f.close()
+from IPython import embed; embed()
+raise ValueError()
 
 plt.plot(clf.training_loss_)
 plt.savefig('training.png')

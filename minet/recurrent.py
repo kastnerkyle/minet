@@ -439,12 +439,12 @@ class AGMMRNN(_BaseRNNRegressor):
         # Neural Networks", Alex Graves
         # http://arxiv.org/pdf/1308.0850v5.pdf
         # Binary cost
-        c1 = -y_b * T.log(binary + 1E-9) - (1 - y_b) * T.log(1 - binary + 1E-9)
+        c_b = -y_b * T.log(binary + 1E-9) - (1 - y_b) * T.log(1 - binary + 1E-9)
         # First part of log Gaussian
-        c2 = -T.log(2 * np.pi) - T.sum(log_var, axis=1) - .5 * T.log(
+        c_g1 = -T.log(2 * np.pi) - T.sum(log_var, axis=1) - .5 * T.log(
             1 - T.sum(corr, axis=1) ** 2 + 1E-9)
         # Multiplier on z
-        c3 = -.5 * 1. / (1 - T.sum(corr, axis=1) ** 2)
+        c_g2 = -.5 * 1. / (1 - T.sum(corr, axis=1) ** 2)
         x1 = X_sym[:, :, 1]
         x1 = T.addbroadcast(x1, 1)
         x2 = X_sym[:, :, 2]
@@ -455,8 +455,8 @@ class AGMMRNN(_BaseRNNRegressor):
         log_var2 = log_var[:, 1, :]
         z = (x1 - mu1) / T.exp(log_var1) ** 2 + (x2 - mu2) / T.exp(log_var2) ** 2
         z -= 2 * T.sum(corr, axis=1) * (x1 - mu1) * (x2 - mu2) / T.exp(log_var1 + log_var2)
-        cost = c1.dimshuffle(0, 'x') + c2 + c3 * z
-        cost = T.sum(-logsumexp(T.log(coeff) + cost, axis=1))
+        cost = c_g1 + c_g2 * z
+        cost = T.sum(-logsumexp(T.log(coeff) + cost, axis=1) - c_b)
 
         grads = T.grad(cost, params)
         self.opt_ = self.optimizer(params)
