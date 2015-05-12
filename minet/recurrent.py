@@ -435,40 +435,28 @@ class AGMMRNN(_BaseRNNRegressor):
         corr = corr.reshape([corr.shape[0],
                             T.cast(corr.shape[1] / coeff.shape[-1], 'int32'),
                             coeff.shape[-1]])
+        # Exact AG cost - see the paper "Generating Sequences with Recurrent
+        # Neural Networks", Alex Graves
+        # http://arxiv.org/pdf/1308.0850v5.pdf
+        # Binary cost
         c1 = -y_b * T.log(binary + 1E-9) - (1 - y_b) * T.log(1 - binary + 1E-9)
+        # First part of log Gaussian
         c2 = -T.log(2 * np.pi) - T.sum(log_var, axis=1) - .5 * T.log(
             1 - T.sum(corr, axis=1) ** 2 + 1E-9)
+        # Multiplier on z
         c3 = -.5 * 1. / (1 - T.sum(corr, axis=1) ** 2)
         x1 = X_sym[:, :, 1]
+        x1 = T.addbroadcast(x1, 1)
         x2 = X_sym[:, :, 2]
+        x2 = T.addbroadcast(x2, 1)
         mu1 = mu[:, 0, :]
         mu2 = mu[:, 1, :]
         log_var1 = log_var[:, 0, :]
         log_var2 = log_var[:, 1, :]
-        if 1:
-            t1 = theano.printing.Print("mu1")(mu1.shape)
-            t2 = theano.printing.Print("log_var1")(log_var1.shape)
-            t3 = theano.printing.Print("x1")(x1.shape)
-            t4 = theano.printing.Print("mu2")(mu2.shape)
-            t5 = theano.printing.Print("log_var2")(log_var2.shape)
-            t6 = theano.printing.Print("x2")(x2.shape)
-            #t = [t1, t2, t3, t4, t5, t6]
-            #f = theano.function([], t)
-        #z = (x1 - mu1) / T.exp(log_var1) ** 2 + (x2 - mu2) / T.exp(log_var2) ** 2
-        z = (x1 - mu1)
-        #z -= 2 * T.sum(corr, axis=1) * (x1 - mu1) * (x2 - mu2) / T.exp(log_var1 + log_var2)
+        z = (x1 - mu1) / T.exp(log_var1) ** 2 + (x2 - mu2) / T.exp(log_var2) ** 2
+        z -= 2 * T.sum(corr, axis=1) * (x1 - mu1) * (x2 - mu2) / T.exp(log_var1 + log_var2)
         cost = c1.dimshuffle(0, 'x') + c2 + c3 * z
         cost = T.sum(-logsumexp(T.log(coeff) + cost, axis=1))
-        """
-        c1 = -0.5 * T.sum(T.sqr(y_r - mu) * T.exp(-log_var) + log_var
-                          + T.log(2 * np.pi), axis=1) - .5 * T.log(
-                              1 - corr).sum(axis=1)
-        c2 = 2 * corr.sum(axis=1) * T.prod(y_r - mu, axis=1) / T.exp(
-            T.sum(log_var, axis=1))
-        cost = c1 - c2
-        cost = T.sum(-logsumexp(T.log(coeff) + cost, axis=1) -
-                     y_b * T.log(binary) - (1 - y_b) * T.log(1 - binary))
-        """
 
         grads = T.grad(cost, params)
         self.opt_ = self.optimizer(params)
