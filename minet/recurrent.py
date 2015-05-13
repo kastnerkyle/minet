@@ -5,6 +5,7 @@ try:
 except ImportError:
     import pickle as cPickle
 import numpy as np
+from scipy import linalg
 import theano
 import theano.tensor as T
 from utils import PickleMixin, minibatch_indices, make_minibatch
@@ -453,8 +454,10 @@ class AGMMRNN(_BaseRNNRegressor):
             1 - T.sum(corr, axis=1) ** 2 + 1E-9)
         # Multiplier on z
         c_g2 = -.5 * 1. / (1 - T.sum(corr, axis=1) ** 2)
-        z = (x1 - mu1) ** 2 / T.exp(log_var1) ** 2 + (x2 - mu2) ** 2 / T.exp(log_var2) ** 2
-        z -= 2 * T.sum(corr, axis=1) * (x1 - mu1) * (x2 - mu2) / (T.exp(log_var1) * T.exp(log_var2))
+        z = (x1 - mu1) ** 2 / T.exp(log_var1) ** 2
+        z += (x2 - mu2) ** 2 / T.exp(log_var2) ** 2
+        z -= 2 * T.sum(corr, axis=1) * (x1 - mu1) * (x2 - mu2) / (
+            T.exp(log_var1) * T.exp(log_var2))
         cost = c_g1 + c_g2 * z
         cost = T.sum(-logsumexp(T.log(coeff) + cost, axis=1) + c_b)
 
@@ -475,7 +478,8 @@ class AGMMRNN(_BaseRNNRegressor):
                                              on_unused_input="ignore")
 
         self.generate_function = theano.function(inputs=[X_sym, X_mask],
-                                                 outputs=[mu, log_var, coeff],
+                                                 outputs=[binary, mu, log_var,
+                                                          corr, coeff],
                                                  on_unused_input="ignore")
     """
     def sample(self, n_steps=100, bias=1., alg="soft", seed_sequence=None,
@@ -517,6 +521,7 @@ class AGMMRNN(_BaseRNNRegressor):
                 raise ValueError("alg must be 'hard' or 'soft'")
             samples[n] = s
         return np.array(samples)
+    """
 
     def force_sample(self, X, bias=1., alg="soft", random_seed=None):
         if len(X.shape) != 2:
@@ -534,27 +539,46 @@ class AGMMRNN(_BaseRNNRegressor):
         for n in range(X.shape[0]):
             # get samples
             # outputs are n_features, n_predictions, n_gaussians
-            mu = r[0][n]
-            log_var = r[1][n]
-            coeff = r[2][n]
+            binary = r[0][n]
+            mu = r[1][n]
+            log_var = r[2][n]
+            corr = r[3][n]
+            coeff = r[4][n]
 
             # Make sure it sums to 1
             coeff = coeff / coeff.sum()
+            full_cov = np.zeros((mu.shape[0], mu.shape[0], mu.shape[1]))
+            var = np.exp(log_var)
+            chol_factors = np.zeros_like(full_cov)
+
+            for i in range(mu.shape[1]):
+                full_cov[0, 0, i] = var[0, i]
+                sx = np.sqrt(var[0, i])
+                full_cov[1, 1, i] = var[1, i]
+                sy = np.sqrt(var[1, i])
+                cov = corr[0, i] * (sx * sy)
+                full_cov[0, 1, i] = cov
+                full_cov[1, 0, i] = cov
+                chol_factors[:, :, i] = linalg.cholesky(full_cov[:, :, i])
+
+            s = np.zeros_like(mu)
             if alg == "hard":
                 # Choice sample
                 k = np.where(random_state.rand() < coeff.cumsum())[0][0]
-                s = random_state.randn(mu.shape[0]) * np.sqrt(
-                    np.exp(log_var[:, k])) + mu[:, k]
+                s = bias * np.dot(random_state.randn(mu.shape[0]),
+                                  chol_factors[:, :, k]) + mu
             elif alg == "soft":
                 # Averaged sample
-                s = bias * random_state.randn(*mu.shape) * np.sqrt(
-                    np.exp(log_var)) + mu
+                for i in range(mu.shape[1]):
+                    s[:, i] = bias * np.dot(random_state.randn(mu.shape[0]),
+                                            chol_factors[:, :, i])
+                s += mu
                 s = np.dot(s, coeff)
             else:
                 raise ValueError("alg must be 'hard' or 'soft'")
-            samples[n] = s
+            samples[n, 0] = binary
+            samples[n, 1:] = s
         return np.array(samples)
-    """
 
 
 class GMMRNN(_BaseRNNRegressor):

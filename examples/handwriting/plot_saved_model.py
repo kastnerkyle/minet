@@ -7,31 +7,41 @@ import cPickle
 
 
 X, y = fetch_iamondb()
-seq = X[0][:, 1:]
-#seq = seq[1:] - seq[:-1]
+seq = X[0]
 seq = seq[:100]
-mi0 = seq.min(axis=0)
-ma0 = seq.max(axis=0)
-seq = (seq - mi0) / (ma0 - mi0)
+seq_delta = seq[:, 1:]
+#seq_delta = seq[1:, 1:] - seq[:-1, 1:]
+mi0 = seq_delta.min(axis=0)
+ma0 = seq_delta.max(axis=0)
+seq_delta = (seq_delta - mi0) / (ma0 - mi0)
+"""
+sm = seq_delta.mean(axis=0)
+ss = seq_delta.std(axis=0)
+seq_delta = (seq_delta - sm) / ss
+"""
+seq[0, :] = 0.
+seq[:, 1:] = seq_delta
 
 model_path = sys.argv[1]
 f = open(model_path, mode='rb')
 clf = cPickle.load(f)
 f.close()
-from IPython import embed; embed()
-raise ValueError()
 
 plt.plot(clf.training_loss_)
 plt.savefig('training.png')
 plt.clf()
 
-t1 = clf.sample(n_steps=len(seq))
+#t1 = clf.sample(n_steps=len(seq))
 t2 = clf.force_sample(seq)
-t3 = clf.sample(bias=0., n_steps=len(seq))
+#t3 = clf.sample(bias=0., n_steps=len(seq))
+t1 = t2
+t3 = t2
 
 def undoit(t):
-    return t * (ma0 - mi0) + mi0
-#    return np.cumsum(t * (ma0 - mi0) + mi0, axis=0)
+    t2 = t
+    t2[:, 1:] = t2[:, 1:] * (ma0 - mi0) + mi0
+    #np.cumsum(t2[:, 1:] * (ma0 - mi0) + mi0, axis=0)
+    return t2
 
 s = undoit(seq)
 t1 = undoit(t1)
@@ -45,16 +55,16 @@ plt.savefig('seq.png')
 plt.clf()
 
 pltt(t1, y[0])
-plt.axis('equal')
+#plt.axis('equal')
 plt.savefig('t1.png')
 plt.clf()
 
 pltt(t2, y[0])
-plt.axis('equal')
+#plt.axis('equal')
 plt.savefig('t2.png')
 plt.clf()
 
 pltt(t3, y[0])
-plt.axis('equal')
+#plt.axis('equal')
 plt.savefig('t3.png')
 plt.clf()
