@@ -453,7 +453,7 @@ class AGMMRNN(_BaseRNNRegressor):
             1 - T.sum(corr, axis=1) ** 2 + 1E-9)
         # Multiplier on z
         c_g2 = -.5 * 1. / (1 - T.sum(corr, axis=1) ** 2)
-        z = (x1 - mu1) / T.exp(log_var1) ** 2 + (x2 - mu2) / T.exp(log_var2) ** 2
+        z = (x1 - mu1) ** 2 / T.exp(log_var1) ** 2 + (x2 - mu2) ** 2 / T.exp(log_var2) ** 2
         z -= 2 * T.sum(corr, axis=1) * (x1 - mu1) * (x2 - mu2) / (T.exp(log_var1) * T.exp(log_var2))
         cost = c_g1 + c_g2 * z
         cost = T.sum(-logsumexp(T.log(coeff) + cost, axis=1) + c_b)
