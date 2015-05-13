@@ -481,47 +481,72 @@ class AGMMRNN(_BaseRNNRegressor):
                                                  outputs=[binary, mu, log_var,
                                                           corr, coeff],
                                                  on_unused_input="ignore")
-    """
+
     def sample(self, n_steps=100, bias=1., alg="soft", seed_sequence=None,
                random_seed=None):
         if random_seed is None:
             random_state = self.random_state
         else:
             random_state = np.random.RandomState(random_seed)
-        if seed_sequence is not None:
-            raise ValueError("Seeded generation not yet supported")
         samples = np.zeros((n_steps, self.n_features))
-        s = random_state.rand(self.n_features)
-        samples[0] = s
-        for n in range(1, n_steps):
+        if seed_sequence is not None:
+            if seed_sequence.shape[1] != self.n_features:
+                raise ValueError("Seed sequence needs to have the same number"
+                                 "of features as the training data!")
+            seed_len = len(seed_sequence)
+            samples[:seed_len, :] = seed_sequence
+        else:
+            seed_len = 1
+            samples[0, :] = np.random.rand(self.n_features)
+        for n in range(seed_len, n_steps):
             X_n = rnn_check_array(samples[None])
             X_n = X_n.transpose(1, 0, 2)
             X_mask = np.ones((X_n.shape[0], X_n.shape[1]),
                              dtype=theano.config.floatX)
             r = self.generate_function(X_n[:n], X_mask[:n])
+
             # get samples
             # outputs are n_features, n_predictions, n_gaussians
-            mu = r[0][-1]
-            log_var = r[1][-1]
-            coeff = r[2][-1]
+            binary = r[0][-1]
+            mu = r[1][-1]
+            log_var = r[2][-1]
+            corr = r[3][-1]
+            coeff = r[4][-1]
 
             # Make sure it sums to 1
             coeff = coeff / coeff.sum()
+            full_cov = np.zeros((mu.shape[0], mu.shape[0], mu.shape[1]))
+            var = np.exp(log_var)
+            chol_factors = np.zeros_like(full_cov)
+
+            for i in range(mu.shape[1]):
+                full_cov[0, 0, i] = var[0, i]
+                sx = np.sqrt(var[0, i])
+                full_cov[1, 1, i] = var[1, i]
+                sy = np.sqrt(var[1, i])
+                cov = corr[0, i] * (sx * sy)
+                full_cov[0, 1, i] = cov
+                full_cov[1, 0, i] = cov
+                chol_factors[:, :, i] = linalg.cholesky(full_cov[:, :, i])
+
+            s = np.zeros_like(mu)
             if alg == "hard":
                 # Choice sample
                 k = np.where(random_state.rand() < coeff.cumsum())[0][0]
-                s = random_state.randn(mu.shape[0]) * np.sqrt(
-                    np.exp(log_var[:, k])) + mu[:, k]
+                s = bias * np.dot(random_state.randn(mu.shape[0]),
+                                  chol_factors[:, :, k]) + mu
             elif alg == "soft":
                 # Averaged sample
-                s = bias * random_state.randn(*mu.shape) * np.sqrt(
-                    np.exp(log_var)) + mu
+                for i in range(mu.shape[1]):
+                    s[:, i] = bias * np.dot(random_state.randn(mu.shape[0]),
+                                            chol_factors[:, :, i])
+                s += mu
                 s = np.dot(s, coeff)
             else:
                 raise ValueError("alg must be 'hard' or 'soft'")
-            samples[n] = s
+            samples[n, 0] = binary
+            samples[n, 1:] = s
         return np.array(samples)
-    """
 
     def force_sample(self, X, bias=1., alg="soft", random_seed=None):
         if len(X.shape) != 2:

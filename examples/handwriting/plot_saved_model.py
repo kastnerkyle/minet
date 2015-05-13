@@ -31,11 +31,10 @@ plt.plot(clf.training_loss_)
 plt.savefig('training.png')
 plt.clf()
 
-#t1 = clf.sample(n_steps=len(seq))
+ss = seq[:75]
+t1 = clf.sample(n_steps=len(seq), seed_sequence=ss)
 t2 = clf.force_sample(seq)
-#t3 = clf.sample(bias=0., n_steps=len(seq))
-t1 = t2
-t3 = t2
+t3 = clf.sample(n_steps=len(seq), bias=0., seed_sequence=ss)
 
 def undoit(t):
     t2 = t
